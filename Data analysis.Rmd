@@ -1,0 +1,950 @@
+---
+title: "Data analysis"
+author: "Annie Hu"
+date: "2026-02-04"
+output: html_document
+---
+
+Population is  all patients admitted to hospital from April 2015 to 31-03 2025 (including emergency and elective), which was cleaned as dataset df_episode. We are interested in cancer patients aging above 16.
+```{r setup, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(lubridate)
+
+setwd("/home/anniehu/AMR Cancer/")
+df <- read_csv("df_episode.csv") 
+micro <- read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/Microbiology.csv') 
+antibiotic <- read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/AntibioticsEPR.csv') 
+```
+Study inclusion and exclusion flow chart
+```{r}
+library(flowchart)
+library(scales)
+library(DiagrammeR)
+
+grViz("
+  digraph flow {
+    graph [rankdir = TB, nodesep = 0.35, ranksep = 0.45, pad = 0.3, splines = polyline]
+    
+    node [shape=box, style='rounded', penwidth=2, fontsize=11, width=4]
+    edge [arrowhead=normal, arrowsize=0.8, penwidth=2]
+    
+    // Main boxes
+    all [label='All blood cultures recorded for cancer patients after first cancer diagnosis code\\n(1 Apr 2015–31 Mar 2025)\\nN = 102,955'];
+    pos1 [label='Positive blood cultures\\nN = 12,210 (11.9%)'];
+    exclu [label='Excluded contaminants: 4,056', width=3];
+    pos2 [label='Bacteraemias retained\\nN = 8,154 (7.9%)'];
+    exclude [label='Excluded repeated bacteraemias for the same pathogen within 14 days of index positive: 2,179', width=3];
+    pos [label='De-duplicated bacteraemias\\nN = 5,975 (7.5%) from 4,365 patients'];
+    exclud [label='Excluded bacteraemias for which models were not fitted:\\nStaphylococcus aureus bacteraemia: 417 with 33 (7.9%) MRSA\\nPseudomonas aeruginosa bacteraemia: 364\\nStreptococcus pneumoniae bacteraemia: 147\\nStenotrophomonas maltophilia bacteraemia: 24\\nBeta haemolytic strep: 254\\nAcinetobacter baumannii bacteraemia: 5\\nAnaerobes:272\\nOthers: 731', width=3];
+    final [label='Bacteraemias containing Enterobacterales and Enterococcus faecalis/faecium\\nN = 3,761 from 2,752 patients', width=4.6];
+    
+    // New boxes
+    entero [label='Enterobacterales\\nN = 3,141', width=2];
+    enterococcus [label='Enterococcus faecalis/faecium\\nN = 620', width=2];
+    
+    
+    
+    // Enterobacterales sub-boxes (6 boxes)
+    entero1 [label='Third-generation-cephalosporin: 3,139\\nLacking AST/unknown AST results: 2', width=1];
+    entero2 [label='Co-amoxiclav: 3,120\\nLacking AST/unknown AST results: 21', width=1];
+    entero3 [label='Fluoroquinolone: 3,138\\nLacking AST/unknown AST results: 3', width=1];
+    entero4 [label='Trimethoprim/Sulfamethoxazole: 3,108\\nLacking AST/unknown AST results: 33', width=1];
+    entero5 [label='Gentamicin: 3,138\\nLacking AST/unknown AST results: 3', width=1];
+    entero6 [label='Piperacillin-tazobactam: 3,139\\nLacking AST/unknown AST results: 2', width=1];
+    
+    // Enterococcus sub-box (1 box)
+    enterococcus1 [label='Vancomycin: 617\\nMissing/unknown AST result:3', width=1];
+    
+    // Small junction nodes
+    pos_j [shape=point, label=\"\", width=0.01, height=0.01];
+    pos_j1 [shape=point, label=\"\", width=0.01, height=0.01];
+    incl_j [shape=point, label=\"\", width=0.01, height=0.01];
+    
+    // Keep exclusions on same rank
+    { rank = same; pos_j; exclu }
+    { rank = same; pos_j1; exclude }
+    { rank = same; incl_j; exclud }
+    { rank = same; entero; enterococcus }
+    { rank = same; entero1; entero2; entero3; entero4; entero5; entero6; enterococcus1 }
+    
+    // Vertical flow: use no-arrow lines to junctions, then arrows to next box
+    all:s -> pos1:n [splines=ortho];
+    pos1:s -> pos_j:n [arrowhead=none, splines=ortho];
+    pos_j:s -> pos2:n [splines=ortho];
+    pos2:s -> pos_j1:n [arrowhead=none, splines=ortho];
+    pos_j1:s-> pos:n [splines=ortho];
+    pos:s -> incl_j:n [arrowhead=none, splines=ortho];
+    incl_j:s -> final:n [splines=ortho];
+    
+    // Split from final to Enterobacterales and Enterococcus
+    final:s -> entero:n [splines=ortho];
+    final:s -> enterococcus:n [splines=ortho];
+    
+    // Route through new exclusion boxes, then to sub-boxes
+    enterococcus -> enterococcus1 [splines=ortho];
+    entero -> entero1 [splines=line];
+    entero -> entero2 [splines=line];
+    entero -> entero3 [splines=line];
+    entero -> entero4 [splines=line];
+    entero -> entero5 [splines=line];
+    entero -> entero6 [splines=line];
+    
+    
+    
+    // Lateral exclusions originate from junction points
+    pos_j:e -> exclu:w [constraint=false, minlen=2, splines=ortho];
+    pos_j1:e -> exclude:w [constraint=false, minlen=2, splines=ortho];
+    incl_j:e -> exclud:w [constraint=false, minlen=2, splines=ortho];
+    
+    // Make junctions invisible
+    pos_j [style=invis];
+    pos_j1 [style=invis];
+    incl_j [style=invis];
+  }
+")
+```
+
+Microbiology
+```{r}
+library(purrr)
+#Enterobacterales
+bugnames = c("Arsenophonus", "Biostraticola", "Brenneria", "Buchnera ", 
+                     "Budvicia", "Buttiauxella", "Cedecea", "Chania", "Citrobacter", 
+                     "Cosenzaea", "Cronobacter", "Dickeya", "Edwardsiella", "Enterobacillus", 
+                     "Enterobacter", "Erwinia", "Escherichia", "Ewingella", "Franconibacter", 
+                     "Gibbsiella", "Hafnia", "Izhakiella", "Klebsiella", "Kluyvera", 
+                     "Kosakonia", "Leclercia", "Lelliottia", "Leminorella", "Limnobaculum", 
+                     "Lonsdalea", "Mangrovibacter", "Metakosakonia", "Mixta", "Moellerella", 
+                     "Morganella", "Obesumbacterium", "Pantoea", "Pectobacterium", "Phaseolibacter", 
+                     "Photorhabdus", "Phytobacter", "Plesiomonas", "Pluralibacter", "Pragia", 
+                     "Proteus", "Providencia", "Pseudescherichia", "Pseudocitrobacter", 
+                     "Rahnella", "Raoultella", "Rosenbergiella", "Rouxiella", 
+                     "Saccharobacter", "Salmonella", "Samsonia", "Scandinavium", 
+                     "Serratia", "Shigella", "Shimwellia", "Siccibacter", "Sodalis", 
+                     "Superficieibacter", "Tatumella", "Trabulsiella", "Wigglesworthia", 
+                     "Xenorhabdus", "Yersinia", "Yokenella", "Coliforms")
+
+#Pseudomonas aeruginosa
+psa_bugnames = c("Pseudomonas aeruginosa")
+
+#Acinetobacter baumannii spp
+acb_bugnames = c("Acinetobacter baumannii")
+
+#Stenotrophomonas maltophilia
+smal_bugnames = c("Stenotrophomonas maltophilia")
+
+#Staphylococcus aureus
+staph_bugnames = c("Staphylococcus aureus")
+
+#S. pneumoniae
+spneum_bugnames = c("Streptococcus pneumoniae")
+
+#Enterococcus
+entero_bugnames = c("Enterococcus faecalis", "Enterococcus faecium")
+
+# If the month is April or later, the financial year starts in the current calendar year. Otherwise (Jan–Mar), the financial year started last year
+get_financial_year <- function(date) {
+  year <- as.integer(format(date, "%Y"))
+  month <- as.integer(format(date, "%m"))
+  fy_start <- ifelse(month >= 4, year, year - 1)
+  paste0(fy_start, "/", substr(fy_start + 1, 3, 4)) # e.g. 2023/24
+}
+
+blood_samples = micro %>% 
+  mutate(year=get_financial_year(CollectionDateTime))  %>% 
+  select(ClusterID, CollectionDateTime, BatTestCode, BatTestName, BugCode, BugName, DrugName, DrugResult, year) %>% 
+  filter(BatTestCode %in% c("BLC"))
+
+blood_samples= blood_samples %>% 
+  distinct(ClusterID, CollectionDateTime, BatTestCode,BatTestName, BugCode, BugName, year) 
+
+# Clean the results of all microbiology data
+micro_2 <- micro %>%
+  mutate(
+    drug_up = DrugResult %>% as.character() %>% str_trim() %>% str_to_upper(),
+    Result = case_when(
+      # RESISTANT patterns
+      drug_up %in% c("R", "POS", "MR") |
+        str_detect(drug_up, "-R(\\b|$)") |
+        str_detect(drug_up, "R-HIDE") |
+        str_detect(drug_up, "^>") & str_detect(drug_up, "R") ~ "Resistant",
+      # SUSCEPTIBLE patterns (SS, S, numeric-MIC-SS, etc.) Intermediate (I) is not truly resistant, it reflects uncertainty or dosing considerations.
+#SDD (“Susceptible Dose-Dependent”) means the drug is usable with higher dosing — clinically closer to susceptible than to resistant.
+      drug_up %in% c("S", "NEG", "SS") |
+        str_detect(drug_up, "-SS(\\b|$)") |
+        str_detect(drug_up, "-S(\\b|$)") |
+        str_detect(drug_up, "SS-HIDE|S-HIDE")|
+        drug_up %in% c("I") |
+        str_detect(drug_up, "I-HIDE") |
+         drug_up %in% c("SDD") ~ "Susceptible",
+      # NOT DONE / NOT DATA / UNKNOWN / NO INTERPRETATION AVAILABLE (NIA) / HIDDEN non-informative flags
+      drug_up %in% c("NULL", "ND", "ND-HIDE", "U", "U-HIDE", "HIDE", "UNK", "UNK-HIDE") |
+        str_detect(drug_up, "\\bND\\b|\\bNOT TESTED\\b|NOT DONE") |
+        str_detect(drug_up, "\\bNIA\\b") |
+        str_detect(drug_up, "-NIA(\\b|$)") ~ "Unknown",
+      # fallback
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  select(-drug_up)
+
+# Clean the drug group, and AST result of the same patient, same pathogen to each abx group for all microbiology data
+ micro_2 <- micro_2 %>% 
+  mutate(drugname=tolower(DrugName)) %>% 
+  mutate(abx= case_when(drugname %in% c("ciprofloxacin", "ciprofloxcin", "levofloxacin", "moxifloxacin","ofloxacin", "norfloxacin", "delafloxacin")~"Fluoroquinolone", 
+                        drugname %in% c("ceftriaxone","ceftazidime", "cefotaxime", "cefixime")~"3rd gen Cephalosporin",
+                        drugname %in% c("ampicillin", "amoxicillin", "piperacillin", "ticarcillin","oxacillin")~"Penicillin",
+                        drugname %in% c("ertapenem", "imipenem","imipenem-relebactam", "meropenem", "doripenem")~"Carbapenem",
+                        drugname %in% c("azithromycin", "clarithromycin", "erythromycin")~"Macrolide",
+                        drugname %in% c("methicillin","flucloxacillin","oxacillin","cefoxitin")~"Methicillin",
+                        drugname %in% c("piptaz","tazocin")~"Piperacillin-tazobactam",
+                        drugname %in% c("co-amoxiclav", "augmentin")~"Co-amoxiclav", 
+                        drugname %in% c("gentamicin", "gentamicin-syn")~"Gentamicin", 
+                        drugname == "amikacin"~"Amikacin",
+                        drugname == "trimethoprim"~"Trimethoprim",
+                        drugname %in% c("trimeth-sulfamethoxazole", "trimeth-sulfamethoxa", "cotrimoxazole")~"TMP-SMX",  
+                        drugname == "vancomycin"~"Vancomycin",
+                        drugname == "methicillin"~"Methicillin",
+                        drugname == "clindamycin"~"Clindamycin",
+                        drugname == "tetracyclines"~"Tetracyclines")) %>% 
+  group_by(ClusterID, CollectionDateTime, BugName, abx) %>% # because each collection date can have a same drug name but  multiple drugresults
+  mutate(Result2=case_when(any(Result=="Resistant")~"Resistant",
+                           all(Result=="Susceptible")~"Susceptible",
+                          TRUE ~ "Unknown")) %>% # Creates Result2, which summarizes resistance per antibiotic class: If any drug in that class is resistant then whole class = "Resistant"
+  ungroup() %>%
+  distinct()
+
+```
+
+```{r}
+df_patient <- read.csv("/home/jane/Cancer AMR/df_patient.csv")
+# combine with cancer patients and the features for each cancer patient to obtain blood samples for all cancer patients.
+df_blood <- df_patient %>% 
+  left_join(df%>%select(ClusterID, AdmissionDate, DischargeDate),by=c("ClusterID"))%>%
+  distinct() %>%
+  inner_join(blood_samples, by = "ClusterID") %>% # at this point one ClusterID can have multiple blood samples
+# so we want to filter the samples with collection time between  AdmissionDate-hours(24) and DischargeDate for each admission
+#  filter(CollectionDateTime >= AdmissionDate-hours(24) & CollectionDateTime < DischargeDate) %>%
+  mutate(TestAge = as.numeric(as_date(CollectionDateTime)-as_date(LinkedBirthMonth))/365.24,
+         Age = as.numeric(as_date(FirstCancerDate)-as_date(LinkedBirthMonth))/365.24) %>%
+  filter(as.numeric(as_date(FirstCancerDate)-as_date(LinkedBirthMonth))/365.24>=16)  # This step filters out all cancer patients aging over 16
+
+df_blood= df_blood %>%
+  mutate(buggroup=case_when(grepl(tolower(paste(bugnames, collapse = "|")), tolower(BugName))~"Enterobacterales",
+                            grepl(tolower(paste(psa_bugnames, collapse = "|")), tolower(BugName))~"Pseudomonas aeruginosa",
+                            grepl(tolower(paste(acb_bugnames, collapse = "|")), tolower(BugName))~"Acinetobacter baumannii",
+                            grepl(tolower(paste(smal_bugnames, collapse = "|")), tolower(BugName))~"Stenotrophomonas maltophilia",
+                            grepl(tolower(paste(staph_bugnames, collapse = "|")), tolower(BugName))~"Staphylococcus aureus",
+                            grepl(tolower(paste(spneum_bugnames, collapse = "|")), tolower(BugName))~"Streptococcus pneumoniae",
+                            grepl(tolower(paste(entero_bugnames, collapse = "|")), tolower(BugName))~"Enterococcus faecalis/faecium",
+                            str_detect(BugName, "ESCHERICHIA COLI") ~ "E COLI",
+                            str_detect(tolower(BugName), tolower("COAGULASE NEGATIVE STAPH|CoNS|STAPH")) ~ "CoNS (CONTAMINANT)",
+                            str_detect(tolower(BugName), tolower("PROPIONIBACTERIUM|DIPHTHEROIDS|MICROCOCCUS|^BACILLUS|Bacillus|AEROBIC SPORE BEARER|CORYNEBACTERIUM")) ~ "OTHER CONTAMINANT",
+                             str_detect(BugName, "CANDIDA") ~ "CANDIDA",
+                        str_detect(BugName, "^BACTEROIDES|ANAEROBIC STREPTOCOCCI|PEPTOSTREPTOCOCCUS|CLOSTRIDIUM|^ANAEROB|PARVIMONAS|PREVOTELLA|VEILLONELLA|PEPTONIPHILUS|FUSOBACTERIUM") ~ "ANAEROBES",
+                        str_detect(BugName,
+                                   "STREPTOCOCCUS AGALACTIAE|STREPTOCOCCUS DYSGALACTIAE|GROUP A STREP|STREPTOCOCCUS PYOGENES|BETA HAEMOLYTIC GROUP|STREPTOCOCCUS SERO GROUP C|STREPTOCOCCUS EQUI$|BETA HAEMOLYTIC STREPTOCOCCI|GROUP B STREPTOCOCCUS|STREPTOCOCCUS SERO GROUP G") ~ "BETA HAEMOLYTIC STREP",
+                        str_detect(BugName, "STREPTOCOCCUS ANGINOSUS|STREPTOCOCCUS GALLOLYTICUS|STREPTOCOCCUS CONSTELLATUS|STREPTOCOCCUS INTERMEDIUS|STREPTOCOCCUS LUTETIENSIS|STREPTOCOCCUS BOVIS") ~ "OTHER PATHOGENIC STREPS",
+                        str_detect(BugName, "STREP") ~ "VIRIDANS AND OTHER STREPS",
+                        str_detect(BugName, "STENOTROPHOMONAS|ACINETOBACTER|HAEMOPHILUS|NEISSERIA|MORAXELLA|PSEUDOMONAS") ~ "OTHER GRAM NEGATIVE",
+                            BugName=="NULL"~NA,
+                            TRUE~"others"))
+
+df_blood <- df_blood %>%
+  mutate(
+    buggroup_norm = buggroup %>%
+      as.character() %>%
+      str_trim() %>%
+      str_to_upper(),
+    Group = case_when(
+      buggroup_norm %in% c(
+        "STAPHYLOCOCCUS AUREUS",
+        "ENTEROCOCCUS FAECALIS/FAECIUM",
+        "BETA HAEMOLYTIC STREP",
+        "OTHER PATHOGENIC STREPS",
+        "STREPTOCOCCUS PNEUMONIAE",
+        "Acinetobacter baumannii"
+      ) ~ "Gram-positive Pathogens",
+
+      buggroup_norm %in% c(
+        "E COLI",
+        "ENTEROBACTERALES",
+        "PSEUDOMONAS AERUGINOSA",
+        "OTHER GRAM NEGATIVE",
+        "PSEUDOMONAS AERUGINOSA",
+"STENOTROPHOMONAS MALTOPHILIA"
+      ) ~ "Gram-negative Pathogens",
+
+      buggroup_norm %in% c("OTHERS") ~ "Other Pathogens",
+
+      buggroup_norm %in% c("ANAEROBES", "CANDIDA") ~ "Anaerobe/fungi",
+
+      buggroup_norm %in% c(
+        "VIRIDANS AND OTHER STREPS",
+        "CONS (CONTAMINANT)",
+        "OTHER CONTAMINANT"
+      ) ~ "Potential Contaminant(s)",
+
+      is.na(buggroup) |
+        buggroup_norm %in% c("", "NULL") ~ "Culture-negative",
+
+      TRUE ~ "Uncategorized"
+    )
+  ) %>%
+  select(-buggroup_norm)
+table(df_blood$buggroup)
+table(df_blood$Group)
+
+#number of tests performed every year among cancer patients
+test_per_year= df_blood %>% 
+  distinct(ClusterID, AdmissionDate, TestAge, DischargeDate,  CollectionDateTime, BatTestCode, Age, year) %>%
+  group_by(year) %>%
+  summarise(Total=n()) %>%
+  ungroup() 
+
+```
+
+```{r}
+df_blood = df_blood %>% 
+  mutate(age_group = case_when(Age<40~"<40",
+                               Age>=40 & Age<60~"40-60",
+                               Age>=60 & Age<80~"60-80",
+                               Age>=80~"80+"),
+         test_age_group = case_when(TestAge<40~"<40",
+                                    TestAge>=40 & TestAge<60~"40-60",
+                                    TestAge>=60 & TestAge<80~"60-80",
+                                    TestAge>=80~"80+"),
+         time_to_test = as.numeric(difftime(CollectionDateTime, FirstCancerDate, units = "days"))) %>% 
+  mutate(band= case_when(time_to_test<0 ~"pre-cancer",
+                         time_to_test>=0 & time_to_test<180~"<6m",
+                         time_to_test>=180&time_to_test<360~"6–12m",
+                         time_to_test>=360&time_to_test<720~"1–2y",
+                         time_to_test>=720&time_to_test<1800~"2–5y",
+                         time_to_test>=1800~">5y")) %>%
+  distinct()
+```
+
+Deduplicated positive blood cultures 
+```{r}
+pt_list <- df_blood %>% filter(band!="pre-cancer") %>%
+  #  keep only positive cultures and required columns; join micro_2 to ensure we have AST rows
+  filter(!is.na(BugCode), BugCode != "NULL") %>%
+  inner_join(
+    micro_2 %>%
+      select(ClusterID, CollectionDateTime, BugName, BugCode, abx, BatTestName, BatTestCode, Result2) %>%
+      distinct()
+  ) %>%
+  distinct() %>%
+  # order and create 14-day episode ids per patient + bug + (antimicrobial). Note that  arrange(ClusterID, BugCode,  CollectionDateTime, abx) is different from  arrange(ClusterID, BugCode, abx, CollectionDateTime)!!!!!!!!!!!
+  arrange(ClusterID, BugCode,  CollectionDateTime, abx) %>%
+  group_by(ClusterID, BugCode) %>%
+  mutate(
+    prev_dt = lag(CollectionDateTime),
+    gap_days = as.numeric(difftime(CollectionDateTime, prev_dt, units = "days")),
+    new_episode = if_else(is.na(gap_days) | gap_days > 14, 1L, 0L),
+    episode_in_group = cumsum(new_episode)
+  ) %>%
+  ungroup() %>% # add 1 once it's a new episode, keep the same if in one episode
+  group_by(ClusterID, BugCode, episode_in_group, abx) %>% # each bug has different episodes, each episode has different abx
+  arrange(CollectionDateTime) %>%                     # ensure earliest first within episode
+  mutate(
+    Result2_update=case_when(any(Result2=="Resistant")~"Resistant",
+                             all(Result2=="Susceptible")~"Susceptible",
+                             TRUE ~ "Unknown"),
+    row_in_episode = row_number()                     # 1 = first/earliest in episode
+  ) %>%
+  # keep only the first row for each abx in one episode (note the colectiondatetime could be different), but replace its Result2 with Result2_update
+  filter(row_in_episode == 1L) %>% # keep the first patient-bug-abx-result in an episode to remove repeated ones
+  mutate(Result2 = Result2_update) %>%
+  ungroup()%>%
+  select(-Result2_update) %>% 
+  group_by(ClusterID, BugCode, episode_in_group) %>%
+  mutate(CollectionDateTime = min(CollectionDateTime))%>% # There existed different abx in one episode with different collection date time, but they should belong to one episode (the first datetime in this episode, so change all collectiondatetime to the first one, otherwise, for the latter time, there could be just one/two abx, causing lack of AST results of other abx)
+  ungroup()%>%
+  distinct() 
+
+df_blood_positive <- pt_list %>% 
+  distinct() #  This contains the deduplicated blood episodes
+
+nrow(df_blood_positive %>% select(ClusterID, CollectionDateTime, BugName)%>%distinct()) #  This contains the deduplicated blood episodes
+```
+Other cultures considered as variables include: "BLOOD CULTURE", "URINE CULTURE", "SURFACE SWAB CULTURE","PUS MICRO / CULTURE", "MRSA SCREEN", "RESP. CULT AND MICRO", "STERILE SITE CULT", "GENITAL CULTURE", "ANTENATAL URINE CULT", "ANAEROBIC CULTURE", "TB CULTURE", "CSF CULT AND MICRO", "CPE SCREEN", "FUNGUS CULTURE", "RESPIRATORY PCR", "ESBL SCREEN", "LINE TIPS CULTURE", "CANDIDA AURIS SCREEN", "CNS DEVICE CULTURE"
+```{r}
+# any cultures
+any_samples = micro_2 %>% 
+  mutate(year=get_financial_year(CollectionDateTime))  %>% 
+  filter(BatTestName %in% c("BLOOD CULTURE", "URINE CULTURE", "SURFACE SWAB CULTURE","PUS MICRO / CULTURE", "MRSA SCREEN", "RESP. CULT AND MICRO", "STERILE SITE CULT", "GENITAL CULTURE", "ANTENATAL URINE CULT", "ANAEROBIC CULTURE", "TB CULTURE", "CSF CULT AND MICRO", "CPE SCREEN", "FUNGUS CULTURE", "RESPIRATORY PCR", "BLOOD BOTTLE CULTURE", "ESBL SCREEN", "LINE TIPS CULTURE", "CANDIDA AURIS SCREEN", "CNS DEVICE CULTURE"))%>% 
+  select(ClusterID, CollectionDateTime, BatTestCode, BatTestName, BugCode, BugName, year)  %>%
+  distinct()
+
+# any micro cultures
+df_any_micro <- df_patient %>% 
+  left_join(df%>%select(ClusterID, AdmissionDate, DischargeDate),by=c("ClusterID"))%>%
+  distinct() %>%
+  inner_join(any_samples, by = "ClusterID") %>% # at this point one ClusterID can have multiple blood samples
+# so we want to filter the samples with collection time between  AdmissionDate-hours(24) and DischargeDate for each admission
+#  filter(CollectionDateTime >= AdmissionDate-hours(24) & CollectionDateTime < DischargeDate) %>%
+  mutate(TestAge = as.numeric(as_date(CollectionDateTime)-as_date(LinkedBirthMonth))/365.24,
+         Age = as.numeric(as_date(FirstCancerDate)-as_date(LinkedBirthMonth))/365.24) %>%
+  filter(as.numeric(as_date(FirstCancerDate)-as_date(LinkedBirthMonth))/365.24>=16)  # This step filters out all cancer patients aging over 16
+  
+df_any_micro= df_any_micro %>%
+  mutate(buggroup=case_when(grepl(tolower(paste(bugnames, collapse = "|")), tolower(BugName))~"Enterobacterales",
+                            grepl(tolower(paste(psa_bugnames, collapse = "|")), tolower(BugName))~"Pseudomonas aeruginosa",
+                            grepl(tolower(paste(acb_bugnames, collapse = "|")), tolower(BugName))~"Acinetobacter baumannii",
+                            grepl(tolower(paste(smal_bugnames, collapse = "|")), tolower(BugName))~"Stenotrophomonas maltophilia",
+                            grepl(tolower(paste(staph_bugnames, collapse = "|")), tolower(BugName))~"Staphylococcus aureus",
+                            grepl(tolower(paste(spneum_bugnames, collapse = "|")), tolower(BugName))~"Streptococcus pneumoniae",
+                            grepl(tolower(paste(entero_bugnames, collapse = "|")), tolower(BugName))~"Enterococcus faecalis/faecium",
+                            str_detect(BugName, "ESCHERICHIA COLI") ~ "E COLI",
+                            str_detect(tolower(BugName), tolower("COAGULASE NEGATIVE STAPH|CoNS|STAPH")) ~ "CoNS (CONTAMINANT)",
+                            str_detect(tolower(BugName), tolower("PROPIONIBACTERIUM|DIPHTHEROIDS|MICROCOCCUS|^BACILLUS|Bacillus|AEROBIC SPORE BEARER|CORYNEBACTERIUM")) ~ "OTHER CONTAMINANT",
+                             str_detect(BugName, "CANDIDA") ~ "CANDIDA",
+                        str_detect(BugName, "^BACTEROIDES|ANAEROBIC STREPTOCOCCI|PEPTOSTREPTOCOCCUS|CLOSTRIDIUM|^ANAEROB|PARVIMONAS|PREVOTELLA|VEILLONELLA|PEPTONIPHILUS|FUSOBACTERIUM") ~ "ANAEROBES",
+                        str_detect(BugName,
+                                   "STREPTOCOCCUS AGALACTIAE|STREPTOCOCCUS DYSGALACTIAE|GROUP A STREP|STREPTOCOCCUS PYOGENES|BETA HAEMOLYTIC GROUP|STREPTOCOCCUS SERO GROUP C|STREPTOCOCCUS EQUI$|BETA HAEMOLYTIC STREPTOCOCCI|GROUP B STREPTOCOCCUS|STREPTOCOCCUS SERO GROUP G") ~ "BETA HAEMOLYTIC STREP",
+                        str_detect(BugName, "STREPTOCOCCUS ANGINOSUS|STREPTOCOCCUS GALLOLYTICUS|STREPTOCOCCUS CONSTELLATUS|STREPTOCOCCUS INTERMEDIUS|STREPTOCOCCUS LUTETIENSIS|STREPTOCOCCUS BOVIS") ~ "OTHER PATHOGENIC STREPS",
+                        str_detect(BugName, "STREP") ~ "VIRIDANS AND OTHER STREPS",
+                        str_detect(BugName, "STENOTROPHOMONAS|ACINETOBACTER|HAEMOPHILUS|NEISSERIA|MORAXELLA|PSEUDOMONAS") ~ "OTHER GRAM NEGATIVE",
+                            BugName=="NULL"~NA,
+                            TRUE~"others"))
+
+# drop repeats unless the current row gives new interpretable info”
+pt_list_micro <- df_any_micro %>%
+  filter(BugCode!="NULL") %>%  # keep only positive cultures
+  inner_join(micro_2 %>%
+      select(ClusterID, CollectionDateTime, BugName, BugCode, abx, BatTestName, BatTestCode, Result2) %>%
+      distinct()
+  ) %>%
+  distinct() %>%
+  # order and create 14-day episode ids per patient + bug
+  arrange(ClusterID, BugCode, BatTestCode, CollectionDateTime) %>%
+  group_by(ClusterID, BugCode, BatTestCode) %>%
+  mutate(
+    prev_dt = lag(CollectionDateTime),
+    gap_days = as.numeric(difftime(CollectionDateTime, prev_dt, units = "days")),
+    new_episode = if_else(is.na(gap_days) | gap_days > 14, 1L, 0L),
+    episode_in_group = cumsum(new_episode)
+  ) %>%
+  ungroup() %>% # add 1 once it's a new episode, keep the same if in one episode
+group_by(ClusterID, BugCode, BatTestCode, episode_in_group, abx) %>%
+  arrange(CollectionDateTime) %>%                     # ensure earliest first record for the same abx within the same episode
+  mutate(
+    Result2_update=case_when(any(Result2=="Resistant")~"Resistant",
+                             all(Result2=="Susceptible")~"Susceptible",
+                             TRUE ~ "Unknown"),
+    row_in_episode = row_number()                     # 1 = first/earliest in episode
+  ) %>%
+  # keep only the first row for each episode, but replace its Result2 with Result2_update
+  filter(row_in_episode == 1L) %>%
+  mutate(Result2 = Result2_update) %>%
+  ungroup()%>%
+  select(-Result2_update) %>%
+  group_by(ClusterID, BugCode, BatTestCode, episode_in_group)%>%
+  mutate(CollectionDateTime = min(CollectionDateTime))%>% # here is because sometimes there are new abx appearing the first time in a later time within one episode, then this will be kept with for example collection date 09-28, but the first record was 09-25 in this episode, so we need to change the collection time 09-28 to 09-25
+  ungroup() %>%
+  distinct()
+
+
+df_any_positive <- pt_list_micro %>% 
+  distinct()
+
+# columns that commonly cause type mismatch in your join
+date_cols <- c(
+  "LinkedBirthMonth", "FirstCancerDate", "AdmissionDate",
+  "DischargeDate", "CollectionDateTime"
+)
+
+# safe parser: if POSIXct/Date => return Date; if character => try parse, fallback to as.Date()
+safe_to_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  if (is.character(x)) {
+    # try several common orders; adjust if your format is different
+    dt <- parse_date_time(x, orders = c("Ymd HMS", "Ymd HM", "Ymd", 
+                                        "dmY HMS", "dmY", "dmy", 
+                                        "mdY HMS", "mdY", "ymd"),
+                          quiet = TRUE)
+    if (all(is.na(dt))) {
+      # final fallback: try as.Date directly (may succeed if "YYYY-MM-DD")
+      return(as.Date(x))
+    } else {
+      return(as.Date(dt))
+    }
+  }
+  # unknown type: return as-is (join may still fail)
+  return(x)
+}
+
+df_any_micro_amr <- df_any_positive  %>% 
+  filter(! buggroup %in% c("CoNS (CONTAMINANT)", "OTHER CONTAMINANT", "VIRIDANS AND OTHER STREPS"))%>% # note VIRIDANS AND OTHER STREPS is not always contaminant, but here for simplicity I just excluded
+  group_by(ClusterID, CollectionDateTime, buggroup, BatTestCode, abx) %>%
+  mutate(Result2_update=case_when(any(Result2=="Resistant")~"Resistant",
+                                  all(Result2=="Susceptible")~"Susceptible",
+                                  TRUE ~ "Unknown"))%>% # Clean AST result for each patient and each pathogen-antimicrobial group
+  mutate(Result2 = Result2_update)%>%
+  select(-Result2_update) %>%
+  ungroup()%>%
+  distinct() 
+
+# if the isolate was trimethoprim sensitive, but co-trim was not tested, set it to sensitive to TMP-SMX (as co-trimoxazole is a combination that includes trimethoprim), otherwise have to set it to missing.
+#  find groups that need a TMP-SMX row
+groups_to_add2 <- df_any_micro_amr %>%
+  group_by(ClusterID, CollectionDateTime, BatTestCode, BugName) %>%
+  summarize(
+    tmp_smx_exists = any(abx == "TMP-SMX", na.rm =TRUE),
+    tmp_sensitive   = any(abx == "Trimethoprim" & Result2 == "Susceptible", na.rm =TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!tmp_smx_exists & tmp_sensitive) %>%
+  select(ClusterID, CollectionDateTime, BatTestCode, BugName)
+
+#  build TMP-SMX rows by copying the Trimethoprim S rows from those groups
+rows_to_add2 <- df_any_micro_amr %>%
+  inner_join(groups_to_add2) %>%
+  filter(abx == "Trimethoprim", Result2 == "Susceptible") %>%
+  mutate(abx = "TMP-SMX")    # change the drug name to the combo
+
+#  append and tidy up
+df_any_micro_amr <- df_any_micro_amr %>%
+  bind_rows(rows_to_add2) %>%
+  # optional: remove exact duplicate rows if any
+  distinct() %>%
+  arrange(ClusterID, CollectionDateTime, BatTestCode, BugName, buggroup, abx)
+
+df_any_micro_amr <- df_any_micro_amr %>% 
+  mutate(abx = ifelse(is.na(abx), "Other abx", abx))
+
+
+table(df_any_micro_amr$buggroup)
+table(df_any_micro_amr$Result2)
+table(df_any_micro_amr$abx)
+
+
+```
+
+person-year = sum of time at risk across patients:
+1. Time at risk starts from the start of Microbiology Data: should start counting person-time from: earliest microbiology data until the earliest of: end of study (April 1, 2025), patient’s date of death, and patient’s last spine check date (last date they were confirmed alive in the NHS).
+
+Do NOT limit follow-up only to hospital stays or admission/discharge dates. The patient is considered at risk regardless of admission status.
+
+2. Time is measured relative to first cancer diagnosis: aligning time on a cancer-diagnosis-centered timescale. t = 0 is the date of first cancer diagnosis for each patient time before diagnosis is negative (e.g., Jan 1, 2015 might be t = -600 days for someone diagnosed in late 2016), time after diagnosis is positive. This is important for:
+a) Plotting infection/test rates over "time since cancer diagnosis"
+b) Comparing trends before vs after diagnosis
+
+3. Cancer diagnosis timing affects risk classification: Patients diagnosed before 2015 will have all of their time during the study (2015 onward) as post-cancer diagnosis time. Patients diagnosed after 2015 will contribute both pre-cancer person-time (before diagnosis), and post-cancer person-time (after diagnosis). This helps analyze infection risk changes around cancer diagnosis.
+
+4. Should count all time, not just during admissions: even if a patient is not admitted to hospital: still include that time in their person-time at risk. This allows for community infections or tests, not just inpatient events.
+```{r}
+df_cancer_person_time =df %>% 
+  distinct(ClusterID, LinkedBirthMonth, LinkedSex, first_cancer_date, ethnicity, LinkedDeathdate, SpineCheckDate, Age) %>% 
+  mutate(risk_start = as.POSIXct("2015-04-01", format="%Y-%m-%d",origin = "1970-01-01", tz = "GMT"),
+         risk_end = pmin(as.POSIXct(LinkedDeathdate, format="%Y-%m-%d",origin = "1970-01-01", tz = "GMT"), as.POSIXct(SpineCheckDate, format="%Y-%m-%d",origin = "1970-01-01", tz = "GMT"), as.POSIXct("2025-03-17", format="%Y-%m-%d",origin = "1970-01-01", tz = "GMT"), na.rm = TRUE))
+
+# Person time by first cancer band: e.g. in the band, within 6 months after the first cancer, how much is the person time at risk?
+df_cancer_person_time <- df_cancer_person_time %>%
+  mutate(
+    cancer_yr0_start = as.POSIXct("2015-04-01"),
+    cancer_yr0_end = first_cancer_date,
+    
+    cancer_yr1_start = first_cancer_date,
+    cancer_yr1_end = add_with_rollback(first_cancer_date, months(6)),
+    
+    cancer_yr2_start =  cancer_yr1_end,
+    cancer_yr2_end = add_with_rollback(first_cancer_date, years(1)),
+    
+    cancer_yr3_start =  cancer_yr2_end,
+    cancer_yr3_end = add_with_rollback(first_cancer_date, years(2)),
+    
+    cancer_yr4_start =  cancer_yr3_end,
+    cancer_yr4_end = add_with_rollback(first_cancer_date, years(5)),
+    
+    cancer_yr5_start =  cancer_yr4_end
+  )
+
+df_cancer_person_time <- df_cancer_person_time %>%
+  mutate(overlap_all=as.numeric(difftime(risk_end, risk_start, units="days"))) %>%
+  mutate(
+    overlap0 = pmax(0, as.numeric(difftime(pmin( cancer_yr0_end, risk_end), pmax( cancer_yr0_start, risk_start), units = "days"))), # if time difference is negative than first cancer date is before 2015-04-01, then time at risk is post cancer time, otherwise, the time difference is the pre cancer time (>=0)
+    overlap1 = pmax(0, as.numeric(difftime(pmin(cancer_yr1_end, risk_end), pmax(cancer_yr1_start, risk_start), units = "days"))),
+    overlap2 = pmax(0, as.numeric(difftime(pmin(cancer_yr2_end, risk_end), pmax(cancer_yr2_start, risk_start), units = "days"))),
+    overlap3 = pmax(0, as.numeric(difftime(pmin(cancer_yr3_end, risk_end), pmax(cancer_yr3_start, risk_start), units = "days"))),
+    overlap4 = pmax(0, as.numeric(difftime(pmin(cancer_yr4_end, risk_end), pmax(cancer_yr4_start, risk_start), units = "days"))),
+    overlap5 = pmax(0, as.numeric(difftime(risk_end, pmax(cancer_yr5_start, risk_start), units = "days")))
+  )
+
+person_time_by_band <- tibble(
+  band = c("pre-cancer", "<6m", "6–12m", "1–2y", "2–5y", ">5y"),
+  person_days = colSums(df_cancer_person_time %>% select(overlap0:overlap5), na.rm = TRUE)
+)
+
+person_time_by_age <- df_cancer_person_time %>%
+  mutate(age_group = case_when(
+    Age < 40 ~ "<40",
+    Age >= 40 & Age < 60 ~ "40–60",
+    Age >= 60 & Age < 80 ~ "60–80",
+    Age >= 80 ~ "80+"
+  )) %>%
+  group_by(age_group) %>%
+  summarise(person_days=sum(overlap_all))
+
+
+
+# Ensure band order is preserved
+person_time_by_band$band <- factor(
+  person_time_by_band$band,
+  levels = c("pre-cancer", "<6m", "6–12m", "1–2y", "2–5y", ">5y")
+)
+
+person_time_by_age$age_group <- factor(
+  person_time_by_age$age_group,
+  levels = c("<40", "40-60", "60-80", "80+")
+)
+
+# Plot person time by band
+ggplot(person_time_by_band, aes(x = band, y = person_days)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Cancer Patients Person-Time by Time Band",
+    x = "Time Band",
+    y = "Total Person-Time (days)"
+  ) +
+  theme_minimal()
+
+
+```
+Person time for cancer patients to plot positive blood tests rate per 1000 person time per financial year
+```{r}
+for (i in 1:10) {
+  start_year <- 2014 + i
+  end_year <- 2015 + i
+  
+  df_cancer_person_time[[paste0("yr", i, "_start")]] <- as.POSIXct(paste0(start_year, "-04-01"), tz = 'GMT')
+  df_cancer_person_time[[paste0("yr", i, "_end")]] <- if_else(end_year==2025, as.POSIXct(paste0(end_year, "-03-17"), tz = 'GMT'), as.POSIXct(paste0(end_year, "-04-01"), tz = 'GMT'))
+}
+
+for (i in 1:10) {
+  start_year <- 2014 + i
+  end_year <- 2015 + i
+  
+  df_cancer_person_time[[paste0("overlap", i, "yearly")]] <- pmax(0,as.numeric(difftime(pmin(df_cancer_person_time[[paste0("yr", i, "_end")]], df_cancer_person_time$risk_end), pmax(df_cancer_person_time[[paste0("yr", i, "_start")]], df_cancer_person_time$risk_start), units = "days")))
+}
+
+
+person_time_yearly <- tibble(
+  year = c("2015/16", "2016/17", "2017/18", "2018/19", "2019/20",
+           "2020/21", "2021/22", "2022/23", "2023/24", "2024/25"),
+  total_person_days = colSums(df_cancer_person_time %>% select(overlap1yearly:overlap10yearly), na.rm = TRUE)
+)
+
+
+df_cancer_person_time_yr <- df_cancer_person_time %>%
+  mutate(age_group = case_when(
+    Age < 40 ~ "<40",
+    Age >= 40 & Age < 60 ~ "40–60",
+    Age >= 60 & Age < 80 ~ "60–80",
+    Age >= 80 ~ "80+"
+  )) %>%
+  group_by(age_group) %>%
+  summarise(across(overlap1yearly:overlap10yearly, ~sum(.x, na.rm = TRUE)))
+
+
+
+# Ensure band order is preserved
+person_time_yearly$year <- factor(
+  person_time_yearly$year,
+  levels = c("2015/16", "2016/17", "2017/18", "2018/19", "2019/20",
+             "2020/21", "2021/22", "2022/23", "2023/24", "2024/25")
+)
+
+
+blood_test_rate_yearly <- person_time_yearly %>%
+  left_join(
+    df_blood %>%
+      group_by(year) %>%
+      summarise(blood_cultures = n()),
+    by = "year"
+  ) %>%
+  mutate(rate_per_1000_days = blood_cultures / total_person_days * 1000)
+```
+
+```{r}
+ggplot(blood_test_rate_yearly, aes(x = year, y = rate_per_1000_days)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Rate of blood cultures taken per 1000 Person-Days by Year",
+    x = "Year",
+    y = "Rate of blood cultures taken per 1000 Person-Days"
+  ) +
+  theme_minimal()
+```
+
+Rate of blood cultures by time group
+Analysis: As patients live longer, total person-days in each band increases. So, even though the number of tests may increase, they are spread over more time, which decreases the rate. The first 6 months post-diagnosis is often a period of active treatment (surgery, chemo, radiation) and close clinical monitoring so more blood tests done, after initial treatment, patients may need fewer tests
+```{r}
+
+df_blood_by_band <- df_blood %>%
+  group_by(band) %>%
+  summarise(freq = n()) %>%
+  left_join(person_time_by_band, by = 'band') 
+
+df_blood_by_year <- df_blood %>%
+  group_by(year) %>%
+  summarise(freq = n())  
+
+df_blood_by_band = df_blood_by_band %>%
+  mutate(rate_by_band = freq/person_days*1000)
+
+df_blood_by_band$band = factor(df_blood_by_band$band, levels = c("pre-cancer", "<6m", "6–12m", "1–2y", "2–5y", ">5y") )
+
+ggplot(df_blood_by_band, aes(x = band, y = freq)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Blood Cultures Taken by Time Band",
+    x = "Time Band",
+    y = "Number of Blood Cultures"
+  ) +
+  theme_minimal()
+
+ggplot(df_blood_by_year, aes(x = year, y = freq)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Blood Cultures Taken by Year",
+    x = "Year",
+    y = "Number of Blood Cultures"
+  ) +
+  theme_minimal()
+
+ggplot(df_blood_by_band, aes(x = band, y = rate_by_band)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Rate of blood cultures taken per 1000 Person-Days by Time Band",
+    x = "Time Band",
+    y = "Rate of blood cultures taken per 1000 Person-Days"
+  ) +
+  theme_minimal()
+
+ggplot(df_blood, aes(x=time_to_test)) +
+  geom_histogram(binwidth = 180, position = "identity") +
+  theme_light()+
+  xlab("Time from first cancer code to specimen")
+```
+1. Positive cultures of blood specimen each year for each bug group
+2. The proportion of the positive blood cultures/all positive blood cultures of each bug group.
+```{r, fig.width=12, fig.height=8}
+# Count number of positive cultures per year per bug group
+positive_by_year_bug <- df_blood_positive %>%
+  filter(!is.na(buggroup)) %>% 
+  count(year, buggroup, name = "n_positive") %>%
+  left_join(person_time_yearly, by = 'year')
+
+ggplot(positive_by_year_bug, aes(year, n_positive))+
+  geom_point()+
+  geom_line(aes(group=buggroup))+
+  facet_wrap(~buggroup, scales = "free")+
+  scale_y_continuous(limits = function(x) c(0, max(x)))+
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Number of positive cultures")+
+  xlab("Year")
+
+
+# Add total per year and calculate proportion of the positive cultures of each bug among all bugs.
+proportion_by_year_bug <- positive_by_year_bug %>%
+  group_by(year) %>%
+  mutate(
+    total = sum(n_positive),
+    proportion = round(n_positive / total * 100, 4)
+  ) %>% 
+  rowwise() %>%
+  mutate(lci=round(prop.test(n_positive, total, conf.level = 0.95)$conf.int[1]*100,4),
+         uci=round(prop.test(n_positive, total, conf.level = 0.95)$conf.int[2]*100,4)) %>%
+  filter(buggroup!="others") %>%
+  ungroup() 
+
+
+ggplot(proportion_by_year_bug, aes(year, proportion))+
+  geom_point()+
+  geom_line(aes(group=buggroup))+
+  geom_errorbar(aes(ymin=lci, ymax=uci), width=0.2)+
+  facet_wrap(~buggroup, scales = "free")+
+  scale_y_continuous(limits = function(x) c(0, max(x)))+
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Proportion of positive cultures among all bugs with positive cultures")+
+  xlab("Year")
+
+# Rate per 1000 person days by year
+rate_by_year_bug <- positive_by_year_bug %>%
+  group_by(year) %>%
+  mutate(
+    rate = round(n_positive / total_person_days * 1000, 4)
+  ) %>% 
+  rowwise() %>%
+  mutate(lci=round(prop.test(n_positive, total_person_days, conf.level = 0.95)$conf.int[1]*1000,4),
+         uci=round(prop.test(n_positive, total_person_days, conf.level = 0.95)$conf.int[2]*1000,4)) %>%
+  filter(buggroup!="others") %>%
+  ungroup() 
+
+ggplot(rate_by_year_bug, aes(year, rate))+
+  geom_point()+
+  geom_line(aes(group=buggroup))+
+  geom_errorbar(aes(ymin=lci, ymax=uci), width=0.2)+
+  facet_wrap(~buggroup, scales = "free")+
+  scale_y_continuous(limits = function(x) c(0, max(x)))+
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Rate of positive cultures per 1000 person-days per year")+
+  xlab("Year")
+
+positive_by_year_bug2 =df_blood %>% 
+  group_by(year) %>%
+  summarise(Total=n()) %>%
+  ungroup() 
+
+proportion_by_year_bug2 <- positive_by_year_bug %>% left_join(positive_by_year_bug2, by="year") %>% 
+  mutate(proportion2=round(n_positive/Total*100, 4)) %>% 
+  rowwise() %>%
+  mutate(lci2=round(prop.test(n_positive, Total, conf.level = 0.95)$conf.int[1]*100,4),
+         uci2=round(prop.test(n_positive, Total, conf.level = 0.95)$conf.int[2]*100,4)) %>%
+  filter(buggroup!="others") %>%
+  ungroup() 
+
+ggplot(proportion_by_year_bug2, aes(year, proportion2))+
+  geom_point()+
+  geom_line(aes(group=buggroup))+
+  geom_errorbar(aes(ymin=lci2, ymax=uci2), width=0.2)+
+  facet_wrap(~buggroup, scales = "free")+
+  scale_y_continuous(limits = function(x) c(0, max(x)))+
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Proportion of positive cultures among all (blood) cultures taken")+
+  xlab("Year")
+
+
+```
+Rate of positive blood tests by time band
+```{r, fig.width=12, fig.height=8}
+positive_by_band <- df_blood_positive %>%
+  filter(!is.na(buggroup)) %>% 
+  count(buggroup, band, name = "n_positive") %>%
+  left_join(person_time_by_band, by = 'band')
+
+positive_by_band = positive_by_band %>%
+  mutate(positive_rate_by_band = n_positive/person_days*1000) %>%
+  rowwise() %>%
+  mutate(lci=round(prop.test(n_positive, person_days, conf.level = 0.95)$conf.int[1]*1000,4),
+         uci=round(prop.test(n_positive, person_days, conf.level = 0.95)$conf.int[2]*1000,4)) %>%
+  filter(buggroup!="others") %>%
+  ungroup() 
+
+positive_by_band$band = factor(positive_by_band$band, levels = c("pre-cancer", "<6m", "6–12m", "1–2y", "2–5y", ">5y") )
+ggplot(positive_by_band, aes(band, positive_rate_by_band))+
+  geom_point()+
+  geom_line(aes(group=buggroup))+
+  geom_errorbar(aes(ymin=lci, ymax=uci), width=0.2)+
+  facet_wrap(~buggroup, scales = "free")+
+  scale_y_continuous(limits = function(x) c(0, max(x)))+
+  theme_light()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ylab("Rate of positive cultures per 1000 person-days by time bands")+
+  xlab("Time bands")
+```
+AMR blood specimen
+If any drug in that antibiotic class at the same collection date is resistant then whole group_by(ClusterID, CollectionDateTime, abx) class = "Resistant".
+
+AMR: how commonly resistance occurs among those bacteraemia.
+Resistant rate per person day: how frequently resistant bacteraemia occur in the entire at-risk population, including those without any bacteraemia.
+```{r}
+# This converted resistance in blood episodes in a pathogen to resistance in blood episodes in a pathogen group.
+df_blood_amr <- df_blood_positive %>%
+  group_by(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  mutate(Result2_update=case_when(any(Result2=="Resistant")~"Resistant",
+                                  all(Result2=="Susceptible")~"Susceptible",
+                                  TRUE ~ "Unknown"))%>%
+  mutate(Result2 = Result2_update)%>%
+  select(-Result2_update) %>%
+  ungroup()%>%
+  distinct() 
+
+# if the isolate was trimethoprim sensitive, but co-trim was not tested you can set it to sensitive (as co-trimoxazole is a combination that includes trimethoprim), otherwise you’ll have to set it to missing.
+#  find groups that need a TMP-SMX row
+groups_to_add <- df_blood_amr %>%
+  group_by(ClusterID, CollectionDateTime, BugName) %>%
+  summarize(
+    tmp_smx_exists = any(abx == "TMP-SMX", na.rm =TRUE),
+    tmp_sensitive   = any(abx == "Trimethoprim" & Result2 == "Susceptible", na.rm =TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!tmp_smx_exists & tmp_sensitive) %>%
+  select(ClusterID, CollectionDateTime, BugName)
+
+#  build TMP-SMX rows by copying the Trimethoprim S rows from those groups
+rows_to_add <- df_blood_amr %>%
+  inner_join(groups_to_add) %>%
+  filter(abx == "Trimethoprim", Result2 == "Susceptible") %>%
+  mutate(abx = "TMP-SMX")    # change the drug name to the combo
+
+#  append and tidy up
+df_blood_amr <- df_blood_amr %>%
+  bind_rows(rows_to_add) %>%
+  # optional: remove exact duplicate rows if any
+  distinct() %>%
+  arrange(ClusterID, CollectionDateTime, BugName, buggroup, abx)
+
+df_blood_amr <- df_blood_amr %>% 
+  mutate(abx = ifelse(is.na(abx), "Other abx", abx))
+
+
+# Patient and Infection Characteristics by Bug Group
+
+blood_summary_table <- df_blood_amr %>%
+  select(buggroup, LinkedSex, ethnicity, Result2, age_group, time_to_test, band, test_age_group) %>%
+  tbl_summary(  # tbl_summary gives unadjusted (univariate) p-values
+    by = Result2,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    label = list(
+      LinkedSex ~ "Sex",
+      ethnicity ~ "Ethnicity",
+      buggroup ~ "Bug Group",
+      age_group ~ "Age Group",
+      time_to_test ~ "Time to Test",
+      band ~ "Time Band",
+      test_age_group ~ "Test Age Group"
+    ),
+    missing = "no"
+  ) %>%
+  add_p(test = everything() ~ "chisq.test") %>%
+  modify_caption("**Patient and Infection Characteristics by Bug Group**")
+blood_summary_table
+
+```
+
+AMR prevalence for all bugs using blood specimen
+```{r}
+#  Count resistant cases per year and bug
+resistant_counts<-df_blood_amr %>%
+  distinct(ClusterID, year, CollectionDateTime, BugName, abx, Result2, Age, age_group, time_to_test, band) %>%
+  filter(Result2 == 'Resistant') %>%
+  group_by(year, BugName) %>%
+  summarise(Resistant_counts = length(ClusterID), .groups = "drop")
+all_counts <- df_blood_amr %>%
+  distinct(ClusterID, year, CollectionDateTime, BugName, abx, Result2, Age, age_group, time_to_test, band) %>%
+  group_by(year, BugName) %>%
+  summarise(
+    Total_positive = length(ClusterID),
+    .groups = "drop"
+  )
+
+
+#  Calculate AMR prevalence (resistant / total)
+amr_summary <- all_counts %>%
+  left_join(resistant_counts, by = c("year", "BugName")) %>%
+  mutate(
+    Resistant_counts = replace_na(Resistant_counts, 0),
+    AMR_rate = round(100 * Resistant_counts / Total_positive, 1)
+  )
+
+```

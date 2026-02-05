@@ -1,0 +1,4290 @@
+---
+title: "Data modelling"
+author: "Annie Hu"
+date: "2026-02-05"
+output: html_document
+---
+```{r setup, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(lubridate)
+library(magrittr)
+library(comorbidity)
+library(gtsummary)
+library(clubSandwich)
+library(sandwich)
+library(lmtest)
+library(huxtable)
+library(parameters)
+library(tidyr)
+library(tableone)   # for SMDs and categorical summaries
+library(broom)
+library(splines)
+library(vcd)       # assocstats() for Cramer's V
+library(corrplot)  # for heatmap plot
+library(car)
+library(gt)
+library(patchwork) # to arrange plots
+setwd("/home/anniehu/AMR Cancer/")
+df_patient <- read_csv("/home/shared/IORD_CancerAMRSurveillance_56_20250430/df_patient.csv") # cancer patients dataset, including first cancer, first cancer date, and demographics
+df_blood_amr <- read_csv("df_blood_amr.csv") # Bacteramia including AST results
+df<- read_csv("df_episode.csv") # Include other infor, e.h. spine check date, death date,...
+df_any_micro_amr <- read_csv("df_any_micro_amr.csv") # Positive isolates in any cultures including AST results
+procedure= read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/InpatProcCodes.csv') # procedure code for identifying cancer procedure code
+cancer_ID = df_patient$ClusterID
+chemotherapy = read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/MedicalOncologyTreatmentCycles.csv') %>% 
+  filter(tx_start_date<"2025-04-01") %>% filter(ClusterID %in% cancer_ID)
+WardStays <- read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/InpatWardStays.csv')
+IMD_all <- read_csv("IMD_all.csv") %>%
+  select(
+    LSOA2011Code = `LSOA code (2011)`,
+    IMDScore2    = `Index of Multiple Deprivation (IMD) Score`,
+    IMDRank      = `Index of Multiple Deprivation (IMD) Rank (where 1 is most deprived)`,
+    IMDDecile2   = `Index of Multiple Deprivation (IMD) Decile (where 1 is most deprived 10% of LSOAs)`
+  ) # https://www.gov.uk/government/statistics/english-indices-of-deprivation-2019
+```
+
+Creating the model using all potential risk factors and joining with the cancer patients data
+```{r}
+abx_final = read_csv("/home/anniehu/AMR Cancer/abx_final.csv")
+abx_final = abx_final %>% 
+  mutate(abx_used= case_when(tolower(Drug) %in% c("ciprofloxacin", "ciprofloxcin", "levofloxacin", "moxifloxacin","ofloxacin", "norfloxacin", "delafloxacin")~"Fluoroquinolone",
+                             tolower(Drug) %in% c("ceftriaxone","ceftazidime", "cefotaxime", "cefixime")~"3rd gen Cephalosporin",
+                             tolower(Drug) %in% c("ampicillin", "amoxicillin", "piperacillin", "ticarcillin","oxacillin", "benzylpenicillin", "phenoxymethylpenicillin", "phenoxymethylpenicillin potassium", "pivmecillinam", "procaine benzylpenicillin", "benzathine benzylpenicillin")~"Penicillin",
+                             tolower(Drug) %in% c("ertapenem", "imipenem","imipenem-relebactam", "meropenem", "doripenem","meropenem-vaborbactam", "imipenem + cilastatin", "imipenem + cilastatin/relebactam", "meropenem-vaborbactam")~"Carbapenem",
+                             tolower(Drug) %in% c("azithromycin", "clarithromycin", "erythromycin", "zzzerythromycin")~"Macrolide",
+                             tolower(Drug) %in% c("methicillin","flucloxacillin","oxacillin","cefoxitin")~"Methicillin",
+                             tolower(Drug) %in% c("piptaz","tazocin", "piperacillin + tazobactam", "piperacillin-tazobactam")~"Piperacillin-tazobactam",
+                             tolower(Drug) %in% c("co-amoxiclav", "augmentin")~"Co-amoxiclav",
+                             tolower(Drug) %in% c("gentamicin", "gentamicin-syn")~"Gentamicin",
+                             tolower(Drug) == "amikacin"~"Amikacin",
+                             tolower(Drug) == "trimethoprim"~"Trimethoprim",
+                             tolower(Drug) %in% c("trimeth-sulfamethoxazole", "trimeth-sulfamethoxa", "co-trimoxazole")~"TMP-SMX",
+                             tolower(Drug) == "vancomycin"~"Vancomycin",
+                             tolower(Drug) == "methicillin"~"Methicillin",
+                             tolower(Drug) == "clindamycin"~"Clindamycin",
+                             tolower(Drug) %in% c("tetracyclines", "doxycycline", "oxytetracycline", "lymecycline", "tigecycline", "minocycline", "tetracycline")~"Tetracyclines"))
+abx_final$abx_used[is.na(abx_final$abx_used)] <- "Unspecified"
+
+
+
+df_model <- df_blood_amr %>%
+  filter(!buggroup %in% c("OTHER CONTAMINANT", "CoNS (CONTAMINANT)")) %>%
+  select(
+    ClusterID, CollectionDateTime, buggroup, abx,
+    LinkedSex, ethnicity, FirstCancerDate, cancer_group,
+    AdmissionDate, DischargeDate, TestAge, test_age_group,
+    time_to_test, band, BugName, Result2
+  ) %>%
+  distinct()
+
+# Antibiotic exposure before the bacteraemia within a year
+df_pre_abx <-  df_model %>%
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         CollectionDateTime = as.Date(CollectionDateTime),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate< CollectionDateTime, DischargeDate >= (CollectionDateTime-days(365))) %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx, Result2) %>% 
+  inner_join(abx_final) %>% 
+  filter(start<= CollectionDateTime- hours(48)) %>% 
+  distinct(ClusterID, buggroup, abx, abx_used, CollectionDateTime, Drug, start, end, Result2) %>%
+  mutate(dd=difftime(end, CollectionDateTime, units = "days")) %>% 
+  filter(dd>=-365) %>%
+  # Check if the antibiotic used matches the one tested for resistance
+  mutate(
+    # Create a flag for matching drug group
+    drug_match = case_when(
+      tolower(abx) == tolower(abx_used) ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    # Calculate days between antibiotic use and resistance testing day
+    days_between = as.numeric(difftime(CollectionDateTime, start, units = "days")),
+    
+    # Create resistance flag
+    resistant_drug_used = case_when(
+      drug_match & Result2 == "Resistant" ~ "Resistant drug used",
+      drug_match & Result2 == "Susceptible" ~ "Susceptible drug used", 
+      TRUE ~ "No matching drug"
+    )
+  ) %>%
+  # Sort by patient, collection date, and antibiotic usage date
+  arrange(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx, abx_used, Drug, start, end, dd, drug_match, days_between, resistant_drug_used)
+
+######### Time on tested abx
+df_test_abx <- df_pre_abx %>%
+  filter(drug_match == TRUE) 
+# Expand to daily sequence (removing overlaps later)
+df_expanded <- df_test_abx %>%
+  mutate(start = as.Date(start),
+         end = as.Date(end)) %>%
+  rowwise() %>%
+  mutate(day_seq = list(seq.Date(start, end, by = "day"))) %>%
+  unnest(day_seq) %>%
+  ungroup()
+
+# Remove overlaps by keeping unique (ClusterID, CollectionDateTime, abx, day_seq)
+df_unique_days <- df_expanded %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx, day_seq)
+
+# Summarise days on tested abx
+days_on_tested_summary <- df_unique_days %>%
+  group_by(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  summarise(days_on_tested_abx = n(), .groups = "drop")
+
+df_model$time = as.Date(df_model$CollectionDateTime)
+days_on_tested_summary$time = as.Date(days_on_tested_summary$CollectionDateTime)
+df_rsk_fct <- df_model %>%
+left_join(days_on_tested_summary %>% select(-CollectionDateTime), by = c("ClusterID","time", "buggroup", "abx")) 
+df_rsk_fct$days_on_tested_abx[is.na(df_rsk_fct$days_on_tested_abx)]=0 # days on the target antibiotic class
+
+
+
+######### Time gap between last any antibiotic use before bacteraemia collection date and the collection date within a year
+df_time_gap_last_abx <- df_pre_abx %>%
+  arrange(ClusterID, CollectionDateTime) %>%
+  group_by(ClusterID, CollectionDateTime) %>% 
+  mutate(time_gap_last_abx = as.numeric(difftime(CollectionDateTime, max(pmin(end,CollectionDateTime)), units = "days"))
+  ) %>%
+  ungroup()
+df_time_gap_last_abx$time = df_time_gap_last_abx$CollectionDateTime
+df_rsk_fct <- df_rsk_fct %>%left_join(df_time_gap_last_abx %>% select(ClusterID, time, time_gap_last_abx), by = c("ClusterID", "time"))
+df_rsk_fct$time_gap_last_abx[is.na(df_rsk_fct$time_gap_last_abx)]=365 #if no abx used then time gap within a year is 365
+
+#########  Days on any antibiotic other than the target antibiotic before bacteraemia within a year
+df_any_abx <- df_pre_abx %>% filter(abx_used != abx)
+
+# Expand to daily sequence (removing overlaps later)
+df_expanded <- df_any_abx %>%
+  mutate(start = as.Date(start),
+         end = as.Date(end)) %>%
+  rowwise() %>%
+  mutate(day_seq = list(seq.Date(start, end, by = "day"))) %>%
+  unnest(day_seq) %>%
+  ungroup()
+
+# Remove overlaps by keeping unique (ClusterID, CollectionDateTime, abx, day_seq)
+df_unique_days <- df_expanded %>%
+  distinct(ClusterID, CollectionDateTime, day_seq)
+
+# Summarise days on any other abx
+days_on_any_summary <- df_unique_days %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  summarise(days_on_any_abx = n(), .groups = "drop")
+
+days_on_any_summary$time = days_on_any_summary$CollectionDateTime
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(days_on_any_summary %>% select(-CollectionDateTime), by = c("ClusterID","time")) %>%
+  distinct()
+
+df_rsk_fct$days_on_any_abx[is.na(df_rsk_fct$days_on_any_abx)]=0
+
+
+
+######### Days in hospital (discharge date was within 1 year before the bacteraemia) within 1 year before the bacteraemia
+hpt_stay = df_model %>% 
+  select(ClusterID, CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         CollectionDateTime = as.Date(CollectionDateTime),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate< CollectionDateTime, DischargeDate >= (CollectionDateTime-days(365))) %>% 
+  distinct(ClusterID, CollectionDateTime, AdmissionDate, DischargeDate) %>% 
+  mutate(
+    dd = difftime(pmin(CollectionDateTime, DischargeDate),pmax(CollectionDateTime-days(365), AdmissionDate),units="days")) %>% 
+  group_by(ClusterID, CollectionDateTime) %>% 
+  summarise(hospital_stays = as.numeric(sum(dd))) %>% 
+  ungroup() 
+
+hpt_stay$time = as.Date(hpt_stay$CollectionDateTime)
+df_rsk_fct<- df_rsk_fct %>%
+  left_join(hpt_stay%>%select(-CollectionDateTime), by = c("ClusterID","time"))%>% 
+  mutate(hospital_stays = ifelse(is.na(hospital_stays), 0, hospital_stays))
+
+######### Community/hospital-onset of each bacteraemia
+infec_source = df_model %>% 
+  select(ClusterID, CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as_datetime(AdmissionDate),
+         CollectionDateTime = as_datetime(CollectionDateTime),
+         DischargeDate = as_datetime(DischargeDate)) %>%
+  filter((AdmissionDate< CollectionDateTime & CollectionDateTime < DischargeDate) | (CollectionDateTime<=AdmissionDate & CollectionDateTime>AdmissionDate-hours(48)) ) %>% 
+  distinct(ClusterID, CollectionDateTime, AdmissionDate, DischargeDate)%>% 
+  group_by(ClusterID, CollectionDateTime) %>%
+  slice_min(order_by = AdmissionDate, n = 1, with_ties = FALSE) %>% 
+  ungroup() %>%
+  mutate(source=ifelse(difftime(CollectionDateTime, AdmissionDate, units="hours")<48, "Community","Hospital")) %>%
+  distinct(ClusterID, CollectionDateTime, source)
+
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(infec_source, by = c("ClusterID", "CollectionDateTime")) %>%
+  mutate(
+    InfecSource = case_when(
+      source == "Hospital" ~ "Hospital",
+      source == "Community" ~ "Community",
+      TRUE ~ "None"
+    )
+  ) %>%
+  select(-source)
+df_rsk_fct$InfecSource[df_rsk_fct$InfecSource == "None"]="Community"
+
+
+
+#procedure W358 is bone marrow transplant.X74 – Delivery of other chemotherapy drugs (but IMPORTANT: “other chemotherapy drugs” here means non-SACT / non-cancer chemo agents) It is not part of the national chemotherapy delivery categories. When coding chemo-radiotherapy both the radiotherapy and chemotherapy elements must be coded by applying PCSX20: Radiotherapy (X65, X67–X69), PCSX27: Delivery of chemotherapy for neoplasm (X72-X73) and PCSX28: Route of administration of chemotherapy for neoplasm. See https://classbrowser.nhs.uk/ref_books/OPCS-4.10_NCCS-2025.pdf
+cancer_proc_code = c("X65","X67","X68","X69","X72","X73",
+                     "W358")
+######### active chemotherapy
+procedure_list = procedure %>%
+  filter(reduce(cancer_proc_code, ~ .x | str_starts(ProcCode, .y), .init = FALSE)) %>% 
+  left_join(df_model %>% select(ClusterID, time), by = "ClusterID") %>%
+  mutate(ProcDate = as.Date(ProcDate)) %>%
+  filter(ProcDate >= time - days(365), ProcDate <= time-14) %>%
+  distinct(ClusterID, time) %>% 
+  mutate(procedure=1)
+
+#ARIA
+
+chemotherapy_list= chemotherapy %>% 
+  mutate(tx_start_date = as.Date(tx_start_date)) %>%
+  left_join(df_model %>% select(ClusterID, time), by = "ClusterID") %>%
+  filter(tx_start_date >= time - days(365), tx_start_date <= time-14) %>%
+  distinct(ClusterID, time) %>%
+  mutate(chemotherapy = 1)
+
+df_rsk_fct$time <- as.Date(df_rsk_fct$CollectionDateTime)
+df_rsk_fct = df_rsk_fct %>% 
+  left_join(procedure_list, by = c("ClusterID", "time")) %>%
+  left_join(chemotherapy_list, by = c("ClusterID", "time")) %>%
+  mutate_at(c("chemotherapy","procedure"), ~replace_na(.,0))%>%
+  distinct()
+
+df_rsk_fct <- df_rsk_fct %>%
+  mutate(active_chemo = if_else(procedure == 1 | chemotherapy == 1, 1, 0)) %>%
+  select(-chemotherapy, -procedure) %>%
+  distinct()
+
+######### Active chemotherapy days: combine the ProcDate and tx_start_date and the cluster id together. Combine ProcDate and tx_start_date to a column called active_chemo_date. Then the active_chemo_days, active chemo days is total days on procedure/chemo from the first date of a patient to the date that the time gap is smaller than 90 days +14 days within a year of collection date time
+# Harmonize inputs
+chemo_dates <- chemotherapy %>%
+  transmute(ClusterID,
+            date = as.Date(tx_start_date),
+            source = "Chemo")
+
+proc_dates <- procedure %>%
+  filter(reduce(cancer_proc_code, ~ .x | str_starts(ProcCode, .y), .init = FALSE)) %>% 
+  transmute(ClusterID,
+            date = as.Date(ProcDate),
+            source = "Procedure")
+
+dates <- bind_rows(chemo_dates, proc_dates) %>%
+  filter(!is.na(date))
+
+# Compute active chemo days
+#  Unified event table
+events <- bind_rows(
+  chemotherapy %>%
+    transmute(ClusterID, active_chemo_date = as.Date(tx_start_date)),
+  procedure %>%
+    filter(reduce(cancer_proc_code, ~ .x | str_starts(ProcCode, .y), .init = FALSE)) %>%
+    transmute(ClusterID, active_chemo_date = as.Date(ProcDate))
+) %>%
+  filter(!is.na(active_chemo_date)) %>%
+  distinct(ClusterID, active_chemo_date)
+
+#  Pair each (ClusterID, time) with events in the extended window [time-365-15, time]
+events_ext <- events %>%
+  inner_join(df_model, by = "ClusterID") %>%
+  filter(active_chemo_date >= time - days(365),
+         active_chemo_date <= time-14) %>%
+  distinct()
+
+# Within each (ClusterID, time), split periods where gaps > split_gap
+periods <- events_ext %>%
+  arrange(ClusterID, time, active_chemo_date) %>%
+  group_by(ClusterID, time) %>%
+  mutate(
+    prev_date  = lag(active_chemo_date),
+    gap_days   = as.integer(active_chemo_date - prev_date),
+    new_period = if_else(is.na(prev_date) | gap_days > 90, 1, 0),
+    period_id  = cumsum(new_period)
+  ) %>%
+  group_by(ClusterID, time, period_id) %>%
+  summarise(
+    period_start = min(active_chemo_date),
+    period_end   = max(active_chemo_date),
+    diff_days = period_end- period_start,
+    .groups = "drop_last"
+  ) %>%
+  ungroup()
+
+
+active_chemo_durations <- periods %>%
+  group_by(ClusterID, time, period_id) %>%
+  summarise(
+    active_chemo_days1 = as.integer(period_end-period_start)+1+14)%>% 
+  ungroup() %>%
+  group_by(ClusterID, time) %>% 
+  summarise(active_chemo_days = sum(active_chemo_days1)) %>% 
+  ungroup()
+
+df_rsk_fct = df_rsk_fct %>% 
+  left_join(active_chemo_durations, by = c("ClusterID", "time")) %>%
+  mutate(active_chemo_days = ifelse(is.na(active_chemo_days), 0, active_chemo_days))
+
+######### Time since last chemo: days between the last date of last period of active chemotherapy and the collection time 
+last_active_chemo<- periods %>%
+  group_by(ClusterID, time) %>%
+  summarise(last_active_chemo_date = max(period_end)+14, .groups = "drop") %>%
+  mutate(days_since_last_active_chemo = as.integer(as.Date(time) - last_active_chemo_date))
+
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(last_active_chemo, by = c("ClusterID","time")) %>%
+  mutate(days_since_last_active_chemo = ifelse(is.na(days_since_last_active_chemo), 365, days_since_last_active_chemo))
+
+nrow(df_rsk_fct %>% filter(active_chemo == 0) %>%
+       filter(!(
+         active_chemo_days == 0 &
+           days_since_last_active_chemo == 365))) # this is zero, nice! logic makes sense
+
+nrow(df_rsk_fct %>% filter(active_chemo != 0) %>%
+       filter((
+         active_chemo_days == 0 |
+           days_since_last_active_chemo == 365))) # this is zero, nice! logic makes sense
+
+######### ethnicity
+df_rsk_fct$ethnicity[is.na(df_rsk_fct$ethnicity)] = "Missed"
+
+
+######### 1-year look-back comorbidity
+outpt_appointments = read_csv('/home/shared/IORD_CancerAMRSurveillance_56_20250430/OutpatAppointments.csv')
+
+
+como_inpt = df_blood_amr %>% 
+  select(ClusterID, CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         CollectionDateTime = as.Date(CollectionDateTime),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate<=CollectionDateTime) %>% 
+  select(ClusterID, CollectionDateTime, AdmissionDate, DischargeDate, EpisodeID) %>% 
+  mutate(dd=difftime(AdmissionDate, CollectionDateTime, units = "days"),
+         index_episode = ifelse(AdmissionDate<=CollectionDateTime & CollectionDateTime<=DischargeDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, CollectionDateTime, index_episode, EpisodeID) %>% 
+  inner_join(InpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID, CollectionDateTime, DiagCode)
+
+como_outpt = df_blood_amr %>% 
+  select(ClusterID, CollectionDateTime) %>% 
+  inner_join(outpt_appointments) %>% 
+  mutate(AppointmentDate = as.Date(AppointmentDate),
+         CollectionDateTime = as.Date(CollectionDateTime)) %>%
+  filter(AppointmentDate<=CollectionDateTime) %>% 
+  select(ClusterID, CollectionDateTime, AppointmentDate,EpisodeID) %>% 
+  mutate(dd=difftime(AppointmentDate, CollectionDateTime, units = "days"),
+         index_episode = ifelse(AppointmentDate==CollectionDateTime,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, CollectionDateTime,index_episode, EpisodeID) %>% 
+  inner_join(OutpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID,CollectionDateTime, DiagCode)
+
+como= rbind(como_inpt, como_outpt) %>% distinct(ClusterID, CollectionDateTime, DiagCode) %>% mutate(id=paste(ClusterID, CollectionDateTime, sep="_")) %>% 
+  comorbidity(id = "id", code = "DiagCode", map = "charlson_icd10_quan", assign0 = FALSE) 
+
+como$charlson = score(como, weights = NULL, assign0 = FALSE)
+
+como <- como %>% 
+  separate(id, into = c("ClusterID", "CollectionDateTime"), sep = "_", convert = TRUE) %>% 
+  mutate(time = as.Date(CollectionDateTime)) 
+
+df_rsk_fct<-df_rsk_fct %>% 
+  left_join(como %>% select(ClusterID, time, charlson),  by = c("ClusterID","time")) 
+
+df_rsk_fct$charlson[is.na(df_rsk_fct$charlson)]=0     
+
+
+
+
+######### 1-year-look-back Frailty score
+frailty_inpt = df_blood_amr %>% 
+  distinct(ClusterID, CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         CollectionDateTime = as.Date(CollectionDateTime),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate<=CollectionDateTime) %>% 
+  select(ClusterID, CollectionDateTime, AdmissionDate, DischargeDate, EpisodeID) %>% 
+  mutate(dd=difftime(AdmissionDate, CollectionDateTime, units = "days"),
+         index_episode = ifelse(AdmissionDate<=CollectionDateTime & CollectionDateTime<=DischargeDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, CollectionDateTime, index_episode, EpisodeID) %>% 
+  inner_join(InpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID, CollectionDateTime, DiagCode)
+
+frailty_outpt = df_blood_amr %>% 
+  distinct(ClusterID, CollectionDateTime) %>% 
+  inner_join(outpt_appointments) %>% 
+  mutate(AppointmentDate = as.Date(AppointmentDate),
+         CollectionDateTime = as.Date(CollectionDateTime)) %>%
+  filter(AppointmentDate<=CollectionDateTime) %>% 
+  select(ClusterID, CollectionDateTime, AppointmentDate,EpisodeID) %>% 
+  mutate(dd=difftime(AppointmentDate, CollectionDateTime, units = "days"),
+         index_episode = ifelse(AppointmentDate==CollectionDateTime,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, CollectionDateTime,index_episode, EpisodeID) %>% 
+  inner_join(OutpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID,CollectionDateTime, DiagCode)
+
+frailty= rbind(frailty_inpt, frailty_outpt) %>% distinct(ClusterID, CollectionDateTime, DiagCode) %>% mutate(id=paste(ClusterID, CollectionDateTime, sep="_")) %>%
+  mutate(diagcode_short=str_sub(DiagCode,1,3)) %>%
+  mutate(score=case_when(diagcode_short=="F00"~7.1,
+                         diagcode_short == "G81"~4.4,
+                         diagcode_short == "G30"~4,
+                         diagcode_short == "I69"~3.7,
+                         diagcode_short == "R29"~3.6,
+                         diagcode_short == "N39"~3.2,
+                         diagcode_short == "F05"~3.2,
+                         diagcode_short == "W19"~3.2,
+                         diagcode_short == "S00"~3.2,                         
+                         diagcode_short == "R31"~3,
+                         diagcode_short == "B96"~2.9,
+                         diagcode_short == "R41"~2.7,
+                         diagcode_short == "R26"~2.6,
+                         diagcode_short == "I67"~2.6,
+                         diagcode_short == "R56"~2.6,
+                         diagcode_short == "R40"~2.5,
+                         diagcode_short == "T83"~2.4,
+                         diagcode_short == "S06"~2.4,
+                         diagcode_short == "S42"~2.3,
+                         diagcode_short == "E87"~2.3,
+                         diagcode_short == "M25"~2.3,
+                         diagcode_short == "E86"~2.3,
+                         diagcode_short == "R54"~2.2,
+                         diagcode_short == "Z50"~2.1,
+                         diagcode_short == "F03"~2.1,
+                         diagcode_short == "W18"~2.1,
+                         diagcode_short == "Z75"~2,
+                         diagcode_short == "F01"~2,
+                         diagcode_short == "S80"~2,
+                         diagcode_short == "L03"~2,
+                         diagcode_short == "H54"~1.9,
+                         diagcode_short == "E53"~1.9,
+                         diagcode_short == "Z60"~1.8,
+                         diagcode_short == "G20"~1.8,
+                         diagcode_short == "R55"~1.8,
+                         diagcode_short == "S22"~1.8,
+                         diagcode_short == "K59"~1.8,
+                         diagcode_short == "N17"~1.8,
+                         diagcode_short == "L89"~1.7,
+                         diagcode_short == "Z22"~1.7,
+                         diagcode_short == "B95"~1.7,
+                         diagcode_short == "L97"~1.6,
+                         diagcode_short == "R44"~1.6,
+                         diagcode_short == "K26"~1.6,
+                         diagcode_short == "I95"~1.6,
+                         diagcode_short == "N19"~1.6,
+                         diagcode_short == "A14"~1.6,
+                         diagcode_short == "Z87"~1.5,
+                         diagcode_short == "J96"~1.5,
+                         diagcode_short == "X59"~1.5,
+                         diagcode_short == "M19"~1.5,
+                         diagcode_short == "G40"~1.5,
+                         diagcode_short == "M81"~1.4,
+                         diagcode_short == "S72"~1.4,
+                         diagcode_short == "S32"~1.4,
+                         diagcode_short == "E16"~1.4,
+                         diagcode_short == "R94"~1.4,
+                         diagcode_short == "N18"~1.4,
+                         diagcode_short == "R33"~1.3,
+                         diagcode_short == "R69"~1.3,
+                         diagcode_short == "N28"~1.3,
+                         diagcode_short == "R32"~1.2,
+                         diagcode_short == "G31"~1.2,
+                         diagcode_short == "Y95"~1.2,
+                         diagcode_short == "S09"~1.2,
+                         diagcode_short == "R45"~1.2,
+                         diagcode_short == "G45"~1.2,
+                         diagcode_short == "Z74"~1.1,
+                         diagcode_short == "M79"~1.1,
+                         diagcode_short == "W06"~1.1,
+                         diagcode_short == "S01"~1.1,
+                         diagcode_short == "A04"~1.1,
+                         diagcode_short == "A09"~1.1,
+                         diagcode_short == "J18"~1.1,
+                         diagcode_short == "J69"~1.0,
+                         diagcode_short == "R47"~1.0,
+                         diagcode_short == "E55"~1.0,
+                         diagcode_short == "Z93"~1.0,
+                         diagcode_short == "R02"~1.0,
+                         diagcode_short == "R63"~0.9,
+                         diagcode_short == "H91"~0.9,
+                         diagcode_short == "W10"~0.9,
+                         diagcode_short == "W01"~0.9,
+                         diagcode_short == "E05"~0.9,
+                         diagcode_short == "M41"~0.9,
+                         diagcode_short == "R13"~0.8,
+                         diagcode_short == "Z99"~0.8,
+                         diagcode_short == "U80"~0.8,
+                         diagcode_short == "M80"~0.8,
+                         diagcode_short == "K92"~0.8,
+                         diagcode_short == "I63"~0.8,
+                         diagcode_short == "N20"~0.7,
+                         diagcode_short == "F10"~0.7,
+                         diagcode_short == "Y84"~0.7,
+                         diagcode_short == "R00"~0.7,
+                         diagcode_short == "J22"~0.7,
+                         diagcode_short == "Z73"~0.6,
+                         diagcode_short == "R79"~0.6,
+                         diagcode_short == "Z91"~0.5,
+                         diagcode_short == "S51"~0.5,
+                         diagcode_short == "F32"~0.5,
+                         diagcode_short == "M48"~0.5,
+                         diagcode_short == "E83"~0.4,
+                         diagcode_short == "M15"~0.4,
+                         diagcode_short == "D64"~0.4,
+                         diagcode_short == "L08"~0.4,
+                         diagcode_short == "R11"~0.3,
+                         diagcode_short == "K52"~0.3,
+                         diagcode_short == "R50"~0.1,
+                         TRUE~0
+  )) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  summarise(frailty_score=sum(score)) %>%
+  ungroup()
+frailty$time = frailty$CollectionDateTime
+
+
+df_rsk_fct = df_rsk_fct %>%
+  left_join(frailty%>%select(-CollectionDateTime), by = c("ClusterID", "time")) %>%
+  mutate_at(c("frailty_score"), ~replace_na(.,0))
+
+######### IMD: Based on CollectionDateTime, choose the most recent IMD score.
+IMD_inpt <- df_blood_amr %>%
+  select(ClusterID, CollectionDateTime) %>%
+  left_join(
+    InpatEpisodes %>%
+      select(ClusterID, AdmissionDate, LSOA2011Code, IMDScore, IMDDecile) %>%
+      filter(IMDDecile != "NULL"),  
+    by = "ClusterID"
+  ) %>%
+  filter((AdmissionDate <= CollectionDateTime+years(10))) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  slice_max(order_by = AdmissionDate, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  distinct(ClusterID, CollectionDateTime,AdmissionDate, LSOA2011Code, IMDScore, IMDDecile)
+
+IMD_outpt = df_blood_amr %>% 
+  select(ClusterID, CollectionDateTime) %>% 
+  left_join(outpt_appointments %>%
+              select(ClusterID, AppointmentDate, LSOA2011Code, IMDScore, IMDDecile) %>%
+              filter(IMDDecile != "NULL"),  
+            by = "ClusterID"
+  ) %>%
+  filter((AppointmentDate <= CollectionDateTime + years(10))) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  slice_max(order_by = AppointmentDate, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  distinct(ClusterID, CollectionDateTime, AppointmentDate,LSOA2011Code, IMDScore, IMDDecile)
+
+# Combine and pick the record with the later event date (AdmissionDate or AppointmentDate)
+IMD <- bind_rows(IMD_inpt, IMD_outpt) %>%
+  distinct(ClusterID, CollectionDateTime, AdmissionDate, AppointmentDate, LSOA2011Code, IMDScore, IMDDecile) %>%
+  mutate(event_date = pmax(AdmissionDate, AppointmentDate, na.rm = TRUE)) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  slice_max(order_by = event_date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  distinct(ClusterID, CollectionDateTime, LSOA2011Code, IMDScore, IMDDecile)
+
+# merge with my data
+IMD <- IMD %>%
+  left_join(IMD_all, by = c("LSOA2011Code"))
+# set the known total number of LSOAs (default for England IMD)
+total_lsoas <- 32844L
+
+IMDPct <- IMD %>%
+  mutate(
+    IMDPercentile = 100 * IMDRank / total_lsoas,
+    IMDDecile_byhand = ceiling(10 * IMDRank / total_lsoas)
+  )
+
+df_rsk_fct<-df_rsk_fct %>%
+  left_join(IMD %>% select(ClusterID, CollectionDateTime, IMDDecile), by = c("ClusterID","CollectionDateTime")) %>%
+  mutate(IMDDecile = IMDDecile)
+
+df_rsk_fct<-df_rsk_fct %>%
+  left_join(IMDPct%>% select(ClusterID, CollectionDateTime, IMDPercentile), by = c("ClusterID","CollectionDateTime")) %>%
+  mutate(IMDPercentile = IMDPercentile)
+
+
+
+
+
+
+######### Number of previous neutrophil tests within a year before collection date of bacteraemia
+lab_summary <- read_csv("/home/shared/IORD_CancerAMRSurveillance_56_20250430/lab_summary.csv") %>% 
+  filter(TestName == "NEUTROPHILS") 
+lab_summary$CollectionTime = lab_summary$CollectionDateTime
+
+neutrophils <- df_model %>% select(ClusterID, CollectionDateTime) %>%
+  inner_join(lab_summary %>% select(ClusterID, CollectionTime)) %>%
+  filter(as.Date(CollectionTime) <= as.Date(CollectionDateTime),
+         as.Date(CollectionTime) >= as.Date(CollectionDateTime)- days(365)) %>%
+  distinct(ClusterID,CollectionDateTime, CollectionTime) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  summarise(total_neut = n()) %>%
+  ungroup() 
+df_rsk_fct<-df_rsk_fct %>%
+  left_join(neutrophils %>% select(ClusterID, CollectionDateTime, total_neut), by = c("ClusterID","CollectionDateTime")) %>%
+  mutate(total_neut = ifelse(is.na(total_neut),0, total_neut))
+
+
+######### Intensive care unit in the last year
+# Look for ICU-related wards:
+WardStays = WardStays %>% select(-ClusterID...7) %>%
+  mutate(ClusterID = ClusterID...1) %>%
+  select(-ClusterID...1)
+
+icu_wards <- df_model %>% left_join(WardStays, by = "ClusterID") %>%
+  mutate(ICUStay = str_detect(WardName, 'ICU|CTVCC|CTCC|Crit Care|CritCare')) %>%
+  mutate(WardStartDate = as.Date(WardStartDate),
+         WardEndDate = as.Date(WardEndDate)) %>%
+  filter(WardStartDate< CollectionDateTime, WardEndDate >= (CollectionDateTime-days(365))) %>% # only filter the stays in all wards in the last year
+  distinct(ClusterID, CollectionDateTime, WardStartDate, WardEndDate, ICUStay) %>% 
+  mutate(
+    dd =  ifelse(ICUStay == TRUE, difftime(pmin(CollectionDateTime, WardEndDate),pmax(CollectionDateTime-days(365), WardStartDate),units="days"), 0)) %>% 
+  group_by(ClusterID, CollectionDateTime) %>% 
+  summarise(icu_stays = as.numeric(sum(dd))) %>% 
+  ungroup() 
+
+df_rsk_fct<- df_rsk_fct %>%
+  left_join(icu_wards%>%select(CollectionDateTime, ClusterID, icu_stays), by = c("ClusterID","CollectionDateTime"))%>% 
+  mutate(icu_stays = ifelse(is.na(icu_stays), 0, icu_stays)) %>%
+  distinct()
+
+######### previous infection with resistance/susceptibility for the tested bug and abx at each CollectionDateTime in last year in blood cultures [binary]
+prev_bug_drug <- df_model %>%
+  arrange(ClusterID, CollectionDateTime) %>%
+  group_by(ClusterID) %>%
+  mutate(
+    prev_bug_R_drug_bld = sapply(row_number(), function(i) { # Group by ClusterID, for all rows (i) in each ClusterID
+      current_time <- CollectionDateTime[i]
+      prior_rows <- 1:(i - 1)
+      if (length(prior_rows) == 0) return(FALSE)  # No previous rows
+      any(
+        CollectionDateTime[1:(i-1)] >= (current_time - days(365)) &
+          CollectionDateTime[1:(i-1)] < current_time &
+          buggroup[prior_rows] == buggroup[i] & 
+          abx[prior_rows] == abx[i] &
+          Result2[prior_rows] == "Resistant"
+      )
+    }),
+    prev_bug_S_drug_bld = sapply(row_number(), function(i) {
+      current_time <- CollectionDateTime[i]
+      prior_rows <- 1:(i - 1)
+      if (length(prior_rows) == 0) return(FALSE)  # No previous rows
+      any(
+        CollectionDateTime[1:(i-1)] >= (current_time - days(365)) &
+          CollectionDateTime[1:(i-1)] < current_time &
+          buggroup[prior_rows] == buggroup[i] & 
+          abx[prior_rows] == abx[i] &
+          Result2[prior_rows] == "Susceptible"
+      )
+    })
+  ) %>%
+  ungroup() %>%
+  mutate(prev_bug_R_drug_bld = as.integer(prev_bug_R_drug_bld),
+         prev_bug_S_drug_bld = as.integer(prev_bug_S_drug_bld)) %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx, prev_bug_R_drug_bld, prev_bug_S_drug_bld)
+
+df_rsk_fct<-df_rsk_fct %>% 
+  left_join(prev_bug_drug, by = c("ClusterID", "CollectionDateTime", "buggroup", "abx")) %>% 
+  mutate(prev_bug_R_drug_bld = ifelse(is.na(prev_bug_R_drug_bld), 0, prev_bug_R_drug_bld),
+         prev_bug_S_drug_bld = ifelse(is.na(prev_bug_S_drug_bld), 0, prev_bug_S_drug_bld)) %>%
+  distinct()
+
+######### previous infection with resistance/susceptibility for the tested bug and non-tested abx at each CollectionDateTime in last year in blood cultures [binary]
+prev_bug <- df_model %>%
+  arrange(ClusterID, CollectionDateTime) %>%
+  group_by(ClusterID) %>%
+  mutate(
+    prev_bug_other_drug_R_bld = sapply(row_number(), function(i) {
+      current_time <- CollectionDateTime[i]
+      prior_rows <- 1:(i - 1)
+      if (length(prior_rows) == 0) return(FALSE)  # No previous rows
+      any(
+        CollectionDateTime[1:(i-1)] >= (current_time - days(365)) &
+          CollectionDateTime[1:(i-1)] < current_time &
+          buggroup[prior_rows] == buggroup[i] &
+          abx[prior_rows] != abx[i] &
+          Result2[prior_rows] == "Resistant"
+      )
+    }),
+    prev_bug_other_drug_S_bld = sapply(row_number(), function(i) {
+      current_time <- CollectionDateTime[i]
+      prior_rows <- 1:(i - 1)
+      if (length(prior_rows) == 0) return(FALSE)  # No previous rows
+      any(
+        CollectionDateTime[1:(i-1)] >= (current_time - days(365)) &
+          CollectionDateTime[1:(i-1)] < current_time &
+          buggroup[prior_rows] == buggroup[i] &
+          abx[prior_rows] != abx[i] &
+          Result2[prior_rows] == "Susceptible"
+      )
+    })
+  ) %>%
+  ungroup() %>%
+  mutate(prev_bug_other_drug_S_bld = as.integer(prev_bug_other_drug_S_bld),
+         prev_bug_other_drug_R_bld = as.integer(prev_bug_other_drug_R_bld)) %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx, prev_bug_other_drug_R_bld, prev_bug_other_drug_S_bld) # need to distinct abx as its for any patient, bug, abx, collection time, whether it has any tested bug but NON-TESTED abx infection
+
+df_rsk_fct<-df_rsk_fct %>% 
+  left_join(prev_bug, by = c("ClusterID", "CollectionDateTime", "buggroup", "abx")) %>% 
+  mutate(prev_bug_other_drug_S_bld = ifelse(is.na(prev_bug_other_drug_S_bld), 0, prev_bug_other_drug_S_bld),
+         prev_bug_other_drug_R_bld = ifelse(is.na(prev_bug_other_drug_R_bld), 0, prev_bug_other_drug_R_bld)) %>% distinct()
+
+
+####  previous infection with resistance/susceptibility for the tested bug and non-tested abx at each CollectionDateTime in last year in any cultures [binary]
+prev_bug_other_abx_any <- df_model %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  left_join(df_any_micro %>%
+              inner_join(micro_2 %>%
+                           select(ClusterID, CollectionDateTime, BugName, BugCode, abx, BatTestName, DrugName, BatTestCode, Result2))%>% filter(DrugName !="NULL")%>%
+              transmute(
+                ClusterID,
+                CollectionTime = CollectionDateTime,
+                buggroup,
+                abx2 = abx,
+                BatTestName = BatTestName,
+                Result3 = Result2
+              ) %>%
+              distinct() , by = c("ClusterID", "buggroup")) %>%
+  filter(
+    !is.na(CollectionTime), # drop those without any previous infection
+    CollectionTime <  CollectionDateTime, 
+    CollectionTime >= (CollectionDateTime - days(365)),
+    is.na(abx2) | abx2 != abx
+  ) %>%
+  group_by(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  summarise(
+    prev_bug_R_other_drug_any = as.integer(any(Result3 == "Resistant", na.rm = TRUE)),
+    prev_bug_S_other_drug_any = as.integer(any(Result3 == "Susceptible", na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+
+############ previous infection with resistance/susceptibility for the tested bug and tested abx at each CollectionDateTime in last year in any cultures [binary]
+prev_bug_abx_any <- df_model %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  left_join(df_any_micro_amr %>%
+              select(ClusterID, CollectionDateTime, buggroup, abx, BatTestName, Result2)%>%
+              transmute(
+                ClusterID,
+                CollectionTime = CollectionDateTime,
+                buggroup,
+                abx2 = abx,
+                BatTestName = BatTestName,
+                Result3 = Result2
+              ) %>%
+              distinct() , by = c("ClusterID", "buggroup")) %>%
+  filter(
+    !is.na(CollectionTime),
+    CollectionTime <  CollectionDateTime, 
+    CollectionTime >= (CollectionDateTime - days(365)),
+    abx2 == abx
+  ) %>%
+  group_by(ClusterID, CollectionDateTime, buggroup, abx) %>%
+  summarise(
+    prev_bug_R_drug_any = as.integer(any(Result3 == "Resistant", na.rm = TRUE)),
+    prev_bug_S_drug_any = as.integer(any(Result3 == "Susceptible", na.rm = TRUE)),
+    .groups = "drop"
+  )
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(prev_bug_abx_any,
+            by = c("ClusterID", "CollectionDateTime", "buggroup", "abx")) %>%
+  mutate(
+    prev_bug_R_drug_any = coalesce(prev_bug_R_drug_any, 0L),
+    prev_bug_S_drug_any = coalesce(prev_bug_S_drug_any, 0L)
+  ) %>%
+  distinct()
+
+
+############ Previous positive catheter specimen urine - CSU,  in the last year. Positive CSU culture can be colonization or infection
+csu_micro <- micro %>%
+  filter(SpecimenCode == "CSU", BugCode != "NULL") %>%
+  rename(CollectionTime = CollectionDateTime) %>%
+  arrange(ClusterID, BugCode, BatTestName, CollectionTime) %>%
+  group_by(ClusterID, BugCode, BatTestName) %>%
+  mutate(
+    prev_dt = lag(CollectionTime),
+    dd = if_else(
+      ClusterID == lag(ClusterID),
+      as.numeric(difftime(CollectionTime, prev_dt, units = "days")),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  filter(coalesce(dd, 999) > 14) %>%
+  distinct(ClusterID, CollectionTime)
+
+df_csu <- df_model %>%
+  inner_join(csu_micro) %>%
+  filter(
+    CollectionTime < CollectionDateTime,
+    CollectionTime >= (CollectionDateTime - days(365))
+  ) %>%
+  distinct(ClusterID, CollectionDateTime) %>%
+  mutate(csu = 1)
+
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(df_csu, by = c("ClusterID", "CollectionDateTime")) %>%
+  mutate(csu = replace_na(csu, 0))%>%distinct() # fill missing with 0
+
+############ Number of total urine cultures taken in the last year 
+uc_samples <- micro %>% #contains negative cultures
+  filter(BatTestCode == "UC") %>%
+  distinct(ClusterID, CollectionDateTime) %>%
+  rename(CollectionTime = CollectionDateTime)
+
+df_uc <- df_model %>%
+  inner_join(uc_samples) %>%
+  distinct(ClusterID, CollectionTime, CollectionDateTime) %>%
+  filter(
+    CollectionTime < CollectionDateTime,
+    CollectionTime >= (CollectionDateTime - days(365))
+  ) %>%
+  group_by(ClusterID, CollectionDateTime) %>%
+  summarise(num_uc = n(), .groups = "drop")
+
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(df_uc, by = c("ClusterID", "CollectionDateTime")) %>%
+  mutate(num_uc = replace_na(num_uc, 0)) %>% distinct()
+
+
+############ Number of total (deduplicated) positive urine cultures with the tested bug  in the last year
+uc_pt_bug <- df_any_micro_amr %>% #all deduplicated positive cultures based on patient ID and pathogens
+  filter(BatTestName == "URINE CULTURE") %>%
+  distinct(ClusterID, CollectionDateTime, buggroup) %>%
+  rename(CollectionTime = CollectionDateTime)
+num_uc_pt <- df_model %>%
+  inner_join(uc_pt_bug, by = c("ClusterID","buggroup")) %>%
+  filter(
+    CollectionTime < CollectionDateTime,
+    CollectionTime >= (CollectionDateTime - days(365))
+  ) %>%
+  distinct(ClusterID, CollectionDateTime, buggroup, CollectionTime)%>%
+  group_by(ClusterID, CollectionDateTime, buggroup) %>%
+  summarise(num_uc_pt_bug = n(), .groups = "drop")
+df_rsk_fct <- df_rsk_fct %>%
+  left_join(num_uc_pt, by = c("ClusterID", "CollectionDateTime", "buggroup")) %>%
+  mutate(num_uc_pt_bug = replace_na(num_uc_pt_bug, 0)) %>% distinct()  # Most people are zero valued
+
+
+############ Calender days to see if resistance is changing over year since the earliest admission date: 01/04/2015
+Calender_time <- df_model %>% ungroup() %>%
+  select(ClusterID, CollectionDateTime) %>%
+  mutate(cld_days = as.Date(CollectionDateTime)-as.Date("2015-04-01")) %>%
+  distinct(ClusterID, CollectionDateTime, cld_days)
+
+df_rsk_fct<-df_rsk_fct %>% 
+  left_join(Calender_time %>% select(ClusterID, CollectionDateTime, cld_days), by = c("ClusterID", "CollectionDateTime")) %>% 
+  mutate(cld_days = ifelse(is.na(cld_days), 0, cld_days)) %>% distinct()
+
+df_rsk_fct = df_rsk_fct %>%
+  select(-AdmissionDate,-DischargeDate, -FirstCancerDate)%>%
+  distinct() 
+
+
+df_rsk_fct$IMDDecile = as.numeric(df_rsk_fct$IMDDecile)
+df_rsk_fct$IMDPercile = as.numeric(df_rsk_fct$IMDPercentile)
+########## Exist R in non-target drugs, fully S in the target drug
+df_rsk_fct$other_drug_only_R<- ifelse(df_rsk_fct$prev_bug_R_other_drug_any==1 & df_rsk_fct$prev_bug_R_drug_any ==0, 1, 0) 
+
+########## Exist a previous positive isolate, but fully S in the tested antibiotics
+df_rsk_fct$fully_S <-ifelse(df_rsk_fct$prev_bug_R_other_drug_any==0 & df_rsk_fct$prev_bug_R_drug_any ==0 & (df_rsk_fct$prev_bug_S_drug_any==1 | df_rsk_fct$prev_bug_S_other_drug_any==1), 1, 0) # EXCEPT UNKNOWN RESULT, no R in drug and other drug and must exists  S in  drug OR other drug 
+
+########## No prior AST result/positive isolate
+df_rsk_fct$no_prev_iso <- ifelse(df_rsk_fct$other_drug_only_R==0 & df_rsk_fct$prev_bug_R_drug_any ==0 & (df_rsk_fct$fully_S==0), 1, 0) # Others are the unknown results excluded or no prior positive isolates
+
+df_rsk_fct$prior_resistance <- dplyr::case_when(
+  df_rsk_fct$prev_bug_R_drug_any == 1           ~ "R_target",
+  df_rsk_fct$other_drug_only_R == 1         ~ "R_other_only",
+  df_rsk_fct$fully_S == 1                   ~ "Fully_S",
+  df_rsk_fct$no_prev_iso == 1               ~ "No_prior_iso",
+  TRUE                               ~ NA_character_
+)
+
+df_rsk_fct$prior_resistance <- factor(
+  df_rsk_fct$prior_resistance,
+  levels = c("No_prior_iso", "R_target", "R_other_only", "Fully_S")
+)
+#### The following three are all zeros, good!!!!!
+nrow(df_rsk_fct %>% filter(no_prev_iso == 1 & (other_drug_only_R== 1 | fully_S == 1 | prev_bug_R_drug_any == 1  )))
+nrow(df_rsk_fct %>% filter( fully_S == 1 & (other_drug_only_R== 1  | prev_bug_R_drug_any == 1  )))
+nrow(df_rsk_fct %>% filter( other_drug_only_R== 1  & prev_bug_R_drug_any == 1  ))
+
+table(df_rsk_fct$prior_resistance_bld)
+table(df_rsk_fct$prior_resistance_non_bld)
+
+```
+The final analysis dataset
+```{r}
+analysis_data <- df_rsk_fct %>%
+  filter(band != "pre-cancer")%>%
+  mutate(
+    # Binary resistance outcome (1 = Resistant, 0 = Sensitive)
+    resistant_result = case_when(
+      Result2 == "Resistant" ~ 1,
+      Result2 == "Susceptible" ~ 0,
+      TRUE ~ NA_real_),
+    LinkedSex = factor(LinkedSex,levels = c("M","F")),
+    ethnicity = factor(ethnicity, levels = c("White","Non-white","Missed")),
+    test_age_group = factor(test_age_group, levels = c("60-80", "<40", "40-60", "80+")),
+    time_to_cancer = factor(band, levels = c("<6m", "6–12m", "1–2y", "2–5y", ">5y")),
+    days_on_any_abx =  days_on_any_abx, # any other drugs, not  in the same abx group
+    days_on_tested_abx = days_on_tested_abx, # drugs in the same abx group
+    TestAge = TestAge,
+    time_gap_last_abx = time_gap_last_abx,
+    hospital_stays = hospital_stays, 
+    num_prev_bld = num_prev_bld,
+    time_to_test = time_to_test,
+    charlson = charlson,
+    frailty_score = frailty_score,
+    IMDDecile = IMDDecile,
+    IMDPercentile = IMDPercentile,
+    total_neut = total_neut, 
+    InfecSource = factor(InfecSource, levels = c("Community", "Hospital")),
+    active_chemo = active_chemo,
+    active_chemo_days = active_chemo_days,
+    time_gap_last_tested_abx = time_gap_last_tested_abx,
+    cancer_group = factor(cancer_group, levels = c("Colorectal", "Others", "Lymphoid/Haematopoietic", "Other skin", "Breast", "Upper GI and hepatobiliary", "Prostate", "Lung", "Melanoma")),
+    prior_resistance = factor(prior_resistance, levels = c("No_prior_iso", "R_target", "R_other_only", "Fully_S"))
+  ) 
+
+
+############## comorbidity and frailty score at the first cancer diagnosis code for patients with records of our interested bug-drug combinations
+dd <- df_blood_amr %>% 
+  filter(band != "pre-cancer") %>% 
+  filter(!buggroup %in% c("OTHER CONTAMINANT", "CoNS (CONTAMINANT)")) %>%
+  filter(
+    (buggroup == "Enterobacterales" & 
+       abx %in% c("3rd gen Cephalosporin","Co-amoxiclav","Fluoroquinolone",
+                  "TMP-SMX","Gentamicin","Piperacillin-tazobactam")) |
+      (buggroup == "Enterococcus faecalis/faecium" & abx == "Vancomycin")
+  ) %>%
+  distinct()
+
+como_inpt2 = dd %>%
+  select(ClusterID, FirstCancerDate,CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         FirstCancerDate = as.Date(FirstCancerDate),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate<=FirstCancerDate) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime, AdmissionDate, DischargeDate, EpisodeID) %>% 
+  mutate(dd=difftime(AdmissionDate,FirstCancerDate, units = "days"),
+         index_episode = ifelse(AdmissionDate<=FirstCancerDate & FirstCancerDate<=DischargeDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime, index_episode, EpisodeID) %>% 
+  inner_join(InpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID, FirstCancerDate, CollectionDateTime, DiagCode)
+
+como_outpt2 = df_blood_amr %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime) %>% 
+  inner_join(outpt_appointments) %>% 
+  mutate(AppointmentDate = as.Date(AppointmentDate),
+         FirstCancerDate = as.Date(FirstCancerDate)) %>%
+  filter(AppointmentDate<=CollectionDateTime) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime, AppointmentDate,EpisodeID) %>% 
+  mutate(dd=difftime(AppointmentDate, FirstCancerDate, units = "days"),
+         index_episode = ifelse(AppointmentDate==FirstCancerDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime,index_episode, EpisodeID) %>% 
+  inner_join(OutpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID, FirstCancerDate, CollectionDateTime, DiagCode)
+
+como2= rbind(como_inpt2, como_outpt2) %>% distinct(ClusterID, FirstCancerDate, CollectionDateTime, DiagCode) %>% mutate(id=paste(ClusterID, FirstCancerDate, sep="_")) %>% 
+  comorbidity(id = "id", code = "DiagCode", map = "charlson_icd10_quan", assign0 = FALSE) 
+
+como2$charlson = score(como2, weights = NULL, assign0 = FALSE)
+
+como2 <- como2 %>% 
+  separate(id, into = c("ClusterID", "FirstCancerDate"), sep = "_", convert = TRUE) %>% 
+  mutate(time = as.Date(FirstCancerDate)) 
+dd$time = as.Date(dd$FirstCancerDate)
+dd<-dd %>% 
+  left_join(como2 %>% select(ClusterID, time, charlson),  by = c("ClusterID","time")) 
+
+dd$charlson[is.na(dd$charlson)]=0     
+
+
+
+
+# 1-year-look-back Frailty score
+frailty_inpt2 = df_blood_amr %>% 
+  distinct(ClusterID, FirstCancerDate, CollectionDateTime) %>% 
+  inner_join(df) %>% 
+  mutate(AdmissionDate = as.Date(AdmissionDate),
+         CollectionDateTime = as.Date(CollectionDateTime),
+         FirstCancerDate = as.Date(FirstCancerDate),
+         DischargeDate = as.Date(DischargeDate)) %>%
+  filter(AdmissionDate<=FirstCancerDate) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime, AdmissionDate, DischargeDate, EpisodeID) %>% 
+  mutate(dd=difftime(AdmissionDate, FirstCancerDate, units = "days"),
+         index_episode = ifelse(AdmissionDate<=FirstCancerDate & FirstCancerDate<=DischargeDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, FirstCancerDate, CollectionDateTime, index_episode, EpisodeID) %>% 
+  inner_join(InpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID, FirstCancerDate, CollectionDateTime, DiagCode)
+
+frailty_outpt2 = df_blood_amr %>% 
+  distinct(ClusterID, FirstCancerDate, CollectionDateTime) %>% 
+  inner_join(outpt_appointments) %>% 
+  mutate(AppointmentDate = as.Date(AppointmentDate),
+         FirstCancerDate = as.Date(FirstCancerDate)) %>%
+  filter(AppointmentDate<=FirstCancerDate) %>% 
+  select(ClusterID, FirstCancerDate, AppointmentDate,EpisodeID) %>% 
+  mutate(dd=difftime(AppointmentDate, FirstCancerDate, units = "days"),
+         index_episode = ifelse(AppointmentDate==FirstCancerDate,1,0)) %>% 
+  filter(dd>=-365) %>% 
+  select(ClusterID, FirstCancerDate,index_episode, EpisodeID) %>% 
+  inner_join(OutpatDiagCodes) %>% 
+  filter(index_episode==0 | DiagNumber>1) %>% 
+  distinct(ClusterID,FirstCancerDate, DiagCode)
+frailty_inpt2<- frailty_inpt2 %>% select(-CollectionDateTime) %>% distinct()
+frailty2= rbind(frailty_inpt2, frailty_outpt2) %>% distinct(ClusterID, FirstCancerDate, DiagCode) %>% mutate(id=paste(ClusterID, FirstCancerDate, sep="_")) %>%
+  mutate(diagcode_short=str_sub(DiagCode,1,3)) %>%
+  mutate(score=case_when(diagcode_short=="F00"~7.1,
+                         diagcode_short == "G81"~4.4,
+                         diagcode_short == "G30"~4,
+                         diagcode_short == "I69"~3.7,
+                         diagcode_short == "R29"~3.6,
+                         diagcode_short == "N39"~3.2,
+                         diagcode_short == "F05"~3.2,
+                         diagcode_short == "W19"~3.2,
+                         diagcode_short == "S00"~3.2,                         
+                         diagcode_short == "R31"~3,
+                         diagcode_short == "B96"~2.9,
+                         diagcode_short == "R41"~2.7,
+                         diagcode_short == "R26"~2.6,
+                         diagcode_short == "I67"~2.6,
+                         diagcode_short == "R56"~2.6,
+                         diagcode_short == "R40"~2.5,
+                         diagcode_short == "T83"~2.4,
+                         diagcode_short == "S06"~2.4,
+                         diagcode_short == "S42"~2.3,
+                         diagcode_short == "E87"~2.3,
+                         diagcode_short == "M25"~2.3,
+                         diagcode_short == "E86"~2.3,
+                         diagcode_short == "R54"~2.2,
+                         diagcode_short == "Z50"~2.1,
+                         diagcode_short == "F03"~2.1,
+                         diagcode_short == "W18"~2.1,
+                         diagcode_short == "Z75"~2,
+                         diagcode_short == "F01"~2,
+                         diagcode_short == "S80"~2,
+                         diagcode_short == "L03"~2,
+                         diagcode_short == "H54"~1.9,
+                         diagcode_short == "E53"~1.9,
+                         diagcode_short == "Z60"~1.8,
+                         diagcode_short == "G20"~1.8,
+                         diagcode_short == "R55"~1.8,
+                         diagcode_short == "S22"~1.8,
+                         diagcode_short == "K59"~1.8,
+                         diagcode_short == "N17"~1.8,
+                         diagcode_short == "L89"~1.7,
+                         diagcode_short == "Z22"~1.7,
+                         diagcode_short == "B95"~1.7,
+                         diagcode_short == "L97"~1.6,
+                         diagcode_short == "R44"~1.6,
+                         diagcode_short == "K26"~1.6,
+                         diagcode_short == "I95"~1.6,
+                         diagcode_short == "N19"~1.6,
+                         diagcode_short == "A14"~1.6,
+                         diagcode_short == "Z87"~1.5,
+                         diagcode_short == "J96"~1.5,
+                         diagcode_short == "X59"~1.5,
+                         diagcode_short == "M19"~1.5,
+                         diagcode_short == "G40"~1.5,
+                         diagcode_short == "M81"~1.4,
+                         diagcode_short == "S72"~1.4,
+                         diagcode_short == "S32"~1.4,
+                         diagcode_short == "E16"~1.4,
+                         diagcode_short == "R94"~1.4,
+                         diagcode_short == "N18"~1.4,
+                         diagcode_short == "R33"~1.3,
+                         diagcode_short == "R69"~1.3,
+                         diagcode_short == "N28"~1.3,
+                         diagcode_short == "R32"~1.2,
+                         diagcode_short == "G31"~1.2,
+                         diagcode_short == "Y95"~1.2,
+                         diagcode_short == "S09"~1.2,
+                         diagcode_short == "R45"~1.2,
+                         diagcode_short == "G45"~1.2,
+                         diagcode_short == "Z74"~1.1,
+                         diagcode_short == "M79"~1.1,
+                         diagcode_short == "W06"~1.1,
+                         diagcode_short == "S01"~1.1,
+                         diagcode_short == "A04"~1.1,
+                         diagcode_short == "A09"~1.1,
+                         diagcode_short == "J18"~1.1,
+                         diagcode_short == "J69"~1.0,
+                         diagcode_short == "R47"~1.0,
+                         diagcode_short == "E55"~1.0,
+                         diagcode_short == "Z93"~1.0,
+                         diagcode_short == "R02"~1.0,
+                         diagcode_short == "R63"~0.9,
+                         diagcode_short == "H91"~0.9,
+                         diagcode_short == "W10"~0.9,
+                         diagcode_short == "W01"~0.9,
+                         diagcode_short == "E05"~0.9,
+                         diagcode_short == "M41"~0.9,
+                         diagcode_short == "R13"~0.8,
+                         diagcode_short == "Z99"~0.8,
+                         diagcode_short == "U80"~0.8,
+                         diagcode_short == "M80"~0.8,
+                         diagcode_short == "K92"~0.8,
+                         diagcode_short == "I63"~0.8,
+                         diagcode_short == "N20"~0.7,
+                         diagcode_short == "F10"~0.7,
+                         diagcode_short == "Y84"~0.7,
+                         diagcode_short == "R00"~0.7,
+                         diagcode_short == "J22"~0.7,
+                         diagcode_short == "Z73"~0.6,
+                         diagcode_short == "R79"~0.6,
+                         diagcode_short == "Z91"~0.5,
+                         diagcode_short == "S51"~0.5,
+                         diagcode_short == "F32"~0.5,
+                         diagcode_short == "M48"~0.5,
+                         diagcode_short == "E83"~0.4,
+                         diagcode_short == "M15"~0.4,
+                         diagcode_short == "D64"~0.4,
+                         diagcode_short == "L08"~0.4,
+                         diagcode_short == "R11"~0.3,
+                         diagcode_short == "K52"~0.3,
+                         diagcode_short == "R50"~0.1,
+                         TRUE~0
+  )) %>%
+  group_by(ClusterID, FirstCancerDate) %>%
+  summarise(frailty_score=sum(score)) %>%
+  ungroup()
+frailty2$time = frailty2$FirstCancerDate
+
+dd<-dd %>% 
+  left_join(frailty2 %>% select(ClusterID, time, frailty_score),  by = c("ClusterID","time")) 
+
+dd$frailty_score[is.na(dd$frailty_score)]=0    
+
+# create one-row-per-patient table for the descriptive table
+
+dd_pat <- dd %>%
+  distinct(ClusterID, .keep_all = TRUE) %>%  # keep first row per ClusterID if multiple
+  mutate(TestAge = if ("TestAge" %in% names(.) ) TestAge else if ("Age" %in% names(.)) Age else NA) %>%
+  select(ClusterID, Age, LinkedSex, cancer_group, ethnicity, charlson, frailty_score)
+
+# sanity check: how many unique patients?
+dd_pat %>% summarise(n_patients = n(), unique_ids = n_distinct(ClusterID))
+
+#  build the gtsummary table (remove ClusterID from variables shown)
+demo_tbl <- dd_pat %>%
+  select(-ClusterID) %>%
+  tbl_summary(
+    type = list(
+      Age ~ "continuous",
+      charlson  ~ "continuous",
+      frailty_score ~ "continuous",
+      LinkedSex ~ "categorical",
+      ethnicity ~ "categorical",
+      cancer_group ~ "categorical"
+    ),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p})"
+    ),
+    digits = list(
+      all_continuous() ~ 1,
+      all_categorical() ~ c(0, 1)
+    ),
+    percent = "cell"
+  )
+
+demo_tbl
+```
+a function identifying and capping the outliers
+```{r}
+cap_outliers <- function(x) {
+  if (!is.numeric(x)) stop("Input must be numeric.")
+  
+  Q1 <- quantile(x, 0.05, na.rm = TRUE)
+  Q3 <- quantile(x, 0.95, na.rm = TRUE)
+  
+  lower_fence <- Q1
+  upper_fence <- Q3 
+  
+  x_capped <- ifelse(x < lower_fence, lower_fence,
+                     ifelse(x > upper_fence, upper_fence, x))
+  
+  return(x_capped)
+}
+```
+Different bug-drug combinations
+```{r}
+analysis_1 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      abx == "3rd gen Cephalosporin") %>%
+  filter(Result2 != "Unknown")
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_1 %>% select( IMDPercentile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.54% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_1$time_gap_30 <- analysis_1$time_gap_last_abx / 30
+analysis_1$hospital_stays_10 <- analysis_1$hospital_stays / 10
+analysis_1$total_neut_10 <- analysis_1$total_neut / 10
+analysis_1$TestAge_10 <- analysis_1$TestAge / 10
+analysis_1$frailty_score_10 <- analysis_1$frailty_score/ 10
+analysis_1$IMDDecile <- analysis_1$IMDDecile
+analysis_1$time_to_test_yearly <- analysis_1$time_to_test/ 365
+analysis_1$days_on_any_abx_10 <- analysis_1$days_on_any_abx/ 10
+analysis_1$num_uc_10 <- analysis_1$num_uc/10
+analysis_1$cld_days_yearly <- analysis_1$cld_days/365
+analysis_1$active_chemo_days_30 <- analysis_1$active_chemo_days/30
+analysis_1$days_since_last_active_chemo_30 <- analysis_1$days_since_last_active_chemo/30
+analysis_1$IMDPercentile = signif(analysis_1$IMDPercentile,2)
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "icu_stays",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days_30",
+  "active_chemo_days",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo"
+  
+)
+
+# Apply outlier capping to all specified variables
+analysis_1[vars_to_cap] <- lapply(analysis_1[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_1$charlson<-as.numeric(analysis_1$charlson)
+analysis_1$days_on_tested_abx<-as.numeric(analysis_1$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource",  "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile", "total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo", "IMDPercentile")
+
+amr_rsk_fct1 <- analysis_1 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct1
+analysis_1 = analysis_1 %>% filter(!is.na(IMDDecile))
+```
+Univariable analysis
+```{r}
+# Univariablly fit in glm 
+# write a tidy function for robust variance and compute CIs
+tidy_robust <- function(x,
+                        cluster_var,
+                        exponentiate = TRUE,
+                        conf.level = 0.95,
+                        ...) {
+  # Cluster-robust variance-covariance matrix
+  vcov_cluster <- sandwich::vcovCL(x, cluster = cluster_var)
+  # Tidy output using broom::tidy
+  broom::tidy(x, conf.int = TRUE, conf.level = conf.level, exponentiate=FALSE, ...) %>%
+    dplyr::mutate(
+      std.error = sqrt(diag(vcov_cluster)),
+      statistic = estimate / std.error,
+      p.value = 2 * pnorm(-abs(statistic)),
+      conf.low = estimate - qnorm(1 - (1 - conf.level) / 2) * std.error,
+      conf.high = estimate + qnorm(1 - (1 - conf.level) / 2) * std.error
+    ) %>%
+    dplyr::mutate(
+      estimate = if (exponentiate) exp(estimate) else estimate,
+      conf.low = if (exponentiate) exp(conf.low) else conf.low,
+      conf.high = if (exponentiate) exp(conf.high) else conf.high,
+    )
+}
+
+univ_1_robust <- analysis_1 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",  "icu_stays",  "IMDDecile", "IMDPercentile",
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "days_since_last_active_chemo_30", "prior_resistance"
+      
+    ),
+    exponentiate = FALSE, # We have set exponentiate = FALSE inside tidy_robust(), the tidier will return raw coefficients (β) and their CIs on the log-odds scale.Then tbl_uvregression(exponentiate = TRUE) will handle exponentiating those values to odds ratios for display.
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+combined_df_1 <- bind_rows(
+  univ_1_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_1 <- combined_df_1 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_1 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+
+```
+A function of choosing splines based on BIC
+```{r, fig.width=10, fig.height=4}
+library(splines)
+choose_spline_model <- function(data, var, outcome = "resistant_result") {
+  # Define boundary knots (10% and 90%)
+  y <- data[[var]]
+  range_min <- min(y, na.rm = TRUE)
+  range_max <- max(y, na.rm = TRUE)
+  boundary_knots <- c(
+    range_min + 0.1 * (range_max - range_min),
+    range_min + 0.9 * (range_max - range_min)
+  )
+  
+  # Candidate nonlinear internal knots, equally spaced in the range of variables
+  internal_knots_list <- list(
+    c(range_min + 0.5  * (range_max - range_min)),
+    c(range_min + 0.33 * (range_max - range_min),
+      range_min + 0.67 * (range_max - range_min)),
+    c(range_min + 0.25 * (range_max - range_min),
+      range_min + 0.5  * (range_max - range_min),
+      range_min + 0.75 * (range_max - range_min)),
+    c(range_min + 0.20 * (range_max - range_min),
+      range_min + 0.40  * (range_max - range_min),
+      range_min + 0.60 * (range_max - range_min),
+      range_min + 0.80 * (range_max - range_min)),
+    c(range_min + 0.17 * (range_max - range_min),
+      range_min + 0.34  * (range_max - range_min),
+      range_min + 0.51 * (range_max - range_min),
+      range_min + 0.68 * (range_max - range_min),
+      range_min + 0.85 * (range_max - range_min))
+  )
+  
+  # Fit linear model (spline with 1 df)
+  formula_linear <- as.formula(
+    paste(outcome, "~ ns(", var, ", df = 1)")
+  )
+  model_linear <- glm(formula_linear, data = data, family = binomial())
+  bic_linear <- BIC(model_linear)
+  
+  # Fit nonlinear models & store results
+ bic_nonlinear <- sapply(internal_knots_list, function(knots) {
+    formula_nl <- as.formula(
+      paste(outcome, "~ ns(", var, ", knots = c(",
+            paste(knots, collapse = ","), 
+            "), Boundary.knots = c(",
+            paste(boundary_knots, collapse = ","), "))")
+    )
+    model_nl <- glm(formula_nl, data = data, family = binomial())
+    BIC(model_nl)
+  })
+  
+  # Find best non-linear model
+  best_nl_bic <- min(bic_nonlinear)
+  best_knots <- internal_knots_list[[which.min(bic_nonlinear)]]
+  
+  # Compare and return
+  if (bic_linear <= best_nl_bic) {
+    return(list(
+      best_model = "linear",
+      BIC = bic_linear,
+      knots = NULL
+    ))
+  } else {
+    return(list(
+      best_model = "non-linear",
+      BIC = best_nl_bic,
+      knots = best_knots
+    ))
+  }
+}
+```
+Enterobacterales and 3rd gen Cephalosporin non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_1,
+  "days_on_any_abx_10"
+)
+model_result_1
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_1,
+  "days_on_tested_abx"
+)
+model_result_2
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_1,
+  "time_gap_30"
+)
+model_result_3
+
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_1,
+  "hospital_stays_10"
+)
+model_result_4 # linear relationship
+
+# TestAge so could just use groups
+model_result_5 <- choose_spline_model(
+  analysis_1,
+  "TestAge_10"
+)
+model_result_5
+
+# Time to test
+model_result_6 <- choose_spline_model(
+  analysis_1,
+  "time_to_test_yearly"
+)
+model_result_6 # non-linear knot at 9.56
+
+range_min_6 <- min(analysis_1$time_to_test_yearly, na.rm = TRUE)
+range_max_6 <- max(analysis_1$time_to_test_yearly, na.rm = TRUE)
+boundary_knots_6 <- c(range_min_6 + 0.1 * (range_max_6 - range_min_6),
+                      range_min_6 + 0.9 * (range_max_6 - range_min_6))
+
+model_6 <- glm(
+  resistant_result ~ ns(time_to_test_yearly, 
+                        knots = 9.56,
+                        Boundary.knots = boundary_knots_6),
+  data = analysis_1,
+  family = binomial()
+)
+
+data_6= data.frame(time_to_test_yearly=seq(0, quantile(analysis_1$time_to_test_yearly,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                   ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                   days_on_any_abx_10=1, time_gap_30 = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                   InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, hospital_stays_10 = 0, prior_resistance = "No_prior_iso")
+
+resistant_link= predict(model_6,
+                        newdata = data_6, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_6$pred=resistant_odds
+data_6$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_6$lower <- lower_link
+data_6$upper <- upper_link
+
+p = ggplot(data_6, aes(time_to_test_yearly , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.05, 1),
+    breaks = c(0.05, 0.1, 0.2, 0.5, 1),
+    labels = c("0.05", "0.1", "0.2", "0.5", "1"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Years since the first cancer diagnostic code") +
+  labs(title = "")
+ggsave("/home/anniehu/AMR Cancer/analysis_1_time_from_cancer.png", p, width = 6, height = 3)
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_1,
+  "num_prev_bld"
+)
+model_result_7
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_1,
+  "charlson"
+)
+model_result_8
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_1,
+  "frailty_score"
+)
+model_result_9
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_1,
+  "IMDPercentile"
+)
+model_result_10
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_1,
+  "total_neut_10"
+)
+model_result_11
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_1,
+  "icu_stays"
+)
+model_result_14
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_1,
+  "num_uc_10"
+)
+model_result_17
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_1,
+  "num_uc_pt_bug"
+)
+model_result_18
+
+
+# calender days
+model_result_19 <- choose_spline_model(
+  analysis_1,
+  "cld_days_yearly"
+)
+model_result_19
+
+model_result_20 <- choose_spline_model(
+  analysis_1,
+  "active_chemo_days_30"
+)
+
+model_result_20 # linear relationship
+```
+A function of backward selection using robust standard errors
+```{r}
+# fast iterative remover using vcovCL for speed (suitable when many clusters)
+iter_remove <- function(mod, cluster, alpha = 0.05,
+                        protected = character(),
+                        maxiter = 200) {
+  if (is.null(cluster)) stop("Please supply a cluster vector")
+  
+  mf <- model.frame(mod)
+  resp <- as.character(formula(mod))[2]
+  term_labels <- attr(terms(mod), "term.labels")  # base term labels (e.g. "ethnicity", "time_gap_30", "ns(...)")
+  removed <- character()
+  fit <- mod
+  
+  # align cluster to model.frame rows
+  if (length(cluster) == nrow(mf)) {
+    cluster_aligned <- cluster
+  } else if (length(cluster) >= nrow(mf)) {
+    cluster_aligned <- cluster[seq_len(nrow(mf))]
+    message("cluster length != nrow(model.frame); using first nrow(mf) elements (best-effort).")
+  } else stop("cluster vector shorter than model frame: cannot align.")
+  
+  for (iter in seq_len(maxiter)) {
+    # Refit using explicitly the current set of terms
+    form <- as.formula(paste(resp, "~", paste(term_labels, collapse = " + ")))
+    fit <- glm(form, data = mf, family = family(mod))
+    
+    # cluster-robust vcov
+    vc <- sandwich::vcovCL(fit, cluster = cluster_aligned)
+    
+    # tidy to get p-values (term names correspond to model.matrix column names)
+    td <- broom::tidy(fit, conf.int = FALSE) %>%   # get coef table without broom doing CIs
+      # join explicit vc-based inference
+      mutate(
+        # extract robust vcov and compute robust SEs explicitly
+        se_robust = sqrt(diag(vc))[match(term, names(coef(fit)))],
+        z = estimate / se_robust,
+        p.value = 2 * (1 - pnorm(abs(z))),
+        conf.low = estimate - qnorm(0.975) * se_robust,
+        conf.high = estimate + qnorm(0.975) * se_robust,
+        # exponentiate to get OR scale
+        OR = exp(estimate),
+        conf.low.OR = exp(conf.low),
+        conf.high.OR = exp(conf.high)
+      ) %>%
+      # remove intercept if desired
+      filter(term != "(Intercept)") %>%
+      # tidy column names (optional)
+      select(term, estimate, se_robust, z, p.value, OR, conf.low.OR, conf.high.OR, everything())
+    if (nrow(td) == 0) break
+    
+    # Obtain model matrix and assign mapping: columns -> term index
+    mm <- stats::model.matrix(fit)
+    assign_map <- attr(mm, "assign")         # vector length = ncol(mm), values = term index (0 = intercept)
+    col_names <- colnames(mm)
+    
+    # build mapping from tidy term rows to term_label (base term)
+    # identify non-intercept columns
+    nonint_cols <- which(col_names != "(Intercept)")
+    # sub-assign and colnames for non-intercept
+    assign_nonint <- assign_map[nonint_cols]
+    colnames_nonint <- col_names[nonint_cols]
+    
+    # Map each column to the corresponding base term label (term_labels[assign])
+    # assign indexes in model.matrix correspond to positions in term_labels (1-based)
+    term_for_col <- sapply(assign_nonint, function(a) {
+      if (a == 0) NA_character_ else term_labels[a]
+    }, USE.NAMES = FALSE)
+    
+    # Create a data frame mapping column-name -> base-term
+    col_map <- data.frame(
+      colname = colnames_nonint,
+      base_term = term_for_col,
+      stringsAsFactors = FALSE
+    )
+    
+    # Join tidy p-values to the col_map by column name
+    # tidy$term should match col_map$colname
+    merged <- merge(col_map, td[, c("term", "estimate", "std.error", "p.value")],
+                    by.x = "colname", by.y = "term", all.x = TRUE, sort = FALSE)
+    
+    # Now for each base_term, inspect the p-values of its columns
+    # (Note: interactions and splines behave the same way: they have a base term label in term_labels)
+    base_terms <- unique(merged$base_term)
+    
+    # Build a vector of removable base_terms
+    removable_bases <- character(0)
+    for (bt in base_terms) {
+      if (is.na(bt)) next
+      # Skip protected exact matches
+      if (bt %in% protected) next
+      
+      # subset rows for this base term
+      rows_bt <- merged[merged$base_term == bt, , drop = FALSE]
+      # if there are NA p-values (rare), treat them as non-removable (conservative)
+      pvals <- rows_bt$p.value
+      if (all(is.na(pvals))) {
+        # cannot evaluate -> skip removal
+        next
+      }
+      
+      # For a factor/term to be removable, *all* of its columns must have p > alpha (and non-NA)
+      # If any p <= alpha (significant), we keep the base term.
+      # For columns with NA p.value, treat them as not > alpha (so they block removal)
+      all_gt_alpha <- all(!is.na(pvals) & (pvals > alpha))
+      
+      if (all_gt_alpha) removable_bases <- c(removable_bases, bt)
+    }
+    
+    # Also consider single-column terms that are not present in merged (shouldn't happen),
+    # but safe-guard: check remaining term_labels that are not in base_terms (rare)
+    others <- setdiff(term_labels, base_terms)
+    if (length(others)) {
+      # try to find their p-values from td by exact term label
+      for (ot in others) {
+        if (ot %in% protected) next
+        pv <- td$p.value[td$term == ot]
+        if (length(pv) == 1 && !is.na(pv) && pv > alpha) removable_bases <- c(removable_bases, ot)
+      }
+    }
+    
+    # If nothing removable, stop
+    if (length(removable_bases) == 0) break
+    
+    # Choose removal order: remove the base_term whose *largest* p-value among its columns is largest
+    # Build max p for each candidate base
+    max_p <- sapply(removable_bases, function(bt) {
+      vals <- merged$p.value[merged$base_term == bt]
+      if (all(is.na(vals))) NA_real_ else max(vals, na.rm = TRUE)
+    }, USE.NAMES = TRUE)
+    
+    # pick the candidate with largest max p
+    pick <- names(which.max(max_p))
+    
+    # Remove that base term from term_labels
+    term_labels <- setdiff(term_labels, pick)
+    removed <- c(removed, pick)
+    
+    # continue loop (refit with fewer terms)
+    if (length(term_labels) == 0) break
+  } # end iter loop
+  
+  list(final_model = fit, removed = removed)
+}
+# example: cluster <- analysis_1$ClusterID
+#res <- iter_remove(fit_imp_15, cluster,  protected = "cancer_group")
+#res$removed       # vector of removed terms in order
+#res$final_model   # final glm
+```
+fit a logistic for "Enterobacterales" &  "3rd gen Cephalosporin"
+```{r}
+# Fit model using imputed data then compute BIC for each imputed dataset
+fit_imp_11 <- glm(resistant_result ~ hospital_stays_10 + ns(time_to_test_yearly, knots = 9.56, Boundary.knots = boundary_knots_5)  +  num_prev_bld  + LinkedSex + cancer_group  + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30  + charlson + frailty_score_10 + total_neut_10 + active_chemo  + InfecSource+ icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance +IMDPercentile, family = binomial(link = "logit"), data = analysis_1
+)
+vif(fit_imp_11)
+BIC(fit_imp_11)
+
+#  Remove ns  
+fit_imp_12 <- glm(resistant_result ~ hospital_stays_10 + time_to_test_yearly  +  num_prev_bld  + LinkedSex + cancer_group  + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30  + charlson + frailty_score_10 + total_neut_10 + active_chemo  + InfecSource+ icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance +IMDPercentile, family = binomial(link = "logit"), data = analysis_1
+)
+BIC(fit_imp_12)
+
+fit_imp_15 <- glm(resistant_result ~  hospital_stays_10  +  time_to_test_yearly+  num_prev_bld  + LinkedSex + cancer_group  + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30  + charlson + frailty_score_10 + total_neut_10 + active_chemo  + InfecSource  + icu_stays  + csu + num_uc_10 + num_uc_pt_bug +  cld_days_yearly +active_chemo_days_30 + prior_resistance+ IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_1
+)
+
+# cluster variable (ensure alignment as above)
+cluster <- analysis_1$ClusterID   # or model.frame(fit_imp_15)$ClusterID
+
+#  run selection (uses your iter_remove which uses vcovCL inside)
+res <- iter_remove(fit_imp_15, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+#  final model
+fit_final1 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final1 <- sandwich::vcovCL(fit_final1, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td1 <- broom::tidy(fit_final1, conf.int = FALSE,vcov = vc_final1)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final1))[match(term, names(coef(fit_final1)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+# build the display table and format p-values
+tab_cs1 <- td1 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs1 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+
+##### Forward selection for interaction terms
+scope <- ~ ( cancer_group   + days_on_tested_abx   + num_prev_bld   +  prior_resistance) *
+  (cancer_group   + days_on_tested_abx   + num_prev_bld   +  prior_resistance)
+
+n <- nrow(analysis_1)
+
+fit_forward <- with(
+  analysis_1,
+  step(
+    glm(resistant_result ~ cancer_group   + days_on_tested_abx   + num_prev_bld   +  prior_resistance,
+        family = binomial()),
+    scope = scope,
+    direction = "forward",
+    k = log(n)  # BIC instead of AIC
+  )
+)
+```
+Enterobacterales and Co-amoxiclav
+```{r}
+analysis_2 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      tolower(abx) == "co-amoxiclav") %>%
+  filter(Result2 != "Unknown")
+
+
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_2 %>% select( IMDDecile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.56% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_2$time_gap_30 <- analysis_2$time_gap_last_abx / 30
+analysis_2$hospital_stays_10 <- analysis_2$hospital_stays / 10
+analysis_2$total_neut_10 <- analysis_2$total_neut / 10
+analysis_2$TestAge_10 <- analysis_2$TestAge / 10
+analysis_2$frailty_score_10 <- analysis_2$frailty_score/ 10
+analysis_2$IMDDecile <- analysis_2$IMDDecile
+analysis_2$IMDPercentile <- analysis_2$IMDPercentile
+analysis_2$time_to_test_yearly <- analysis_2$time_to_test/ 365
+analysis_2$days_on_any_abx_10 <- analysis_2$days_on_any_abx/ 10
+analysis_2$num_uc_10 <- analysis_2$num_uc/10
+analysis_2$cld_days_yearly <- analysis_2$cld_days/365
+analysis_2$active_chemo_days_30 <- analysis_2$active_chemo_days/365
+analysis_2$days_since_last_active_chemo_30 <- analysis_2$days_since_last_active_chemo/365
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days",
+  "active_chemo_days_30",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo"
+  
+)
+
+# Apply outlier capping to all specified variables
+analysis_2[vars_to_cap] <- lapply(analysis_2[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_2$charlson<-as.numeric(analysis_2$charlson)
+analysis_2$days_on_tested_abx<-as.numeric(analysis_2$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource","csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile", "IMDPercentile", "total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+
+amr_rsk_fct <- analysis_2 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+```
+Univariable analysis
+```{r}
+# Univariablly fit in glm 
+univ_2_robust <- analysis_2 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",   "icu_stays",  "IMDDecile", "IMDPercentile",
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "days_since_last_active_chemo_30", "prior_resistance"
+      
+    ),
+    exponentiate = FALSE, # We have set exponentiate = true inside tidy_robust(), the tidier will return exponential of coefficients (β) and their CIs on the log-odds scale.Then tbl_uvregression(exponentiate = FALSE) will handle exponentiating those values to odds ratios for display.
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+combined_df_2 <- bind_rows(
+  univ_2_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+combined_df_2 <- combined_df_2 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_2 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+
+```
+Enterobacterales and co-amoxilav non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_2,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # linear relationship
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_2,
+  "days_on_tested_abx"
+)
+
+model_result_2 # linear relationship 
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_2,
+  "time_gap_30"
+)
+
+model_result_3 # non-linear, knots at 6.08. 
+
+resistant_link= predict(model_3,
+                        newdata = data_3, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_3$pred=resistant_odds
+data_3$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_3$lower <- lower_link
+data_3$upper <- upper_link
+
+
+
+p = ggplot(data_3, aes(time_gap_30 , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.2, 3),
+    breaks = c(0.2,  0.5, 1, 2),
+    labels = c("0.2", "0.5", "1", "2"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Months since the last use of antibiotics") +
+  labs(title = "")
+
+ggsave("/home/anniehu/AMR Cancer/analysis_7_time_gap.png", p, width = 6, height = 4)
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_2,
+  "hospital_stays_10"
+)
+
+model_result_4 # linear relationship 
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_2,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_2,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_2,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 18, but looks linear, so just use linear
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_2,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_2,
+  "frailty_score_10"
+)
+
+model_result_9 # linear relationship
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_2,
+  "IMDPercentile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_2,
+  "total_neut_10"
+)
+
+model_result_11  # linear relationship
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_2,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_2,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_2,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # linear relationship
+
+# calender days
+# num_uc_pt_bug
+model_result_19 <- choose_spline_model(
+  analysis_2,
+  "cld_days_yearly"
+)
+
+model_result_19  # linear relationship
+
+model_result_20 <- choose_spline_model(
+  analysis_2,
+  "active_chemo_days_30"
+)
+
+model_result_20  # linear relationship
+```
+
+fit a logistic for "Enterobacterales" &  "co-amoxiclav"
+```{r}
+fit_imp_21 <-  glm(resistant_result ~ ns(time_gap_30, knots = 6.083, Boundary.knots = boundary_knots_3)  + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   + hospital_stays_10  + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource   + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30  +prior_resistance + IMDPercentile,   
+                   family = binomial(link = "logit"), data = analysis_2
+)
+BIC(fit_imp_21)
+
+#  Remove ns
+fit_imp_22 <- glm(resistant_result ~ ns(time_gap_30, knots = 6.083, Boundary.knots = boundary_knots_3) + ns(days_since_last_active_chemo_30, knots = 0.501, Boundary.knots = boundary_knots_21) + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   + hospital_stays_10 + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource   + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + ns(active_chemo_days_30, knots = 0.49, Boundary.knots = boundary_knots_20)   +prev_bug_R_other_drug_non_bld + prev_bug_other_drug_R_bld  + prev_bug_R_drug_non_bld + prev_bug_S_drug_non_bld  + prev_bug_S_drug_bld + IMDDecile,   
+                  family = binomial(link = "logit"), data = analysis_2
+)
+BIC(fit_imp_22)
+
+fit_imp_23 <- glm(resistant_result ~ ns(time_gap_30, knots = 6.083, Boundary.knots = boundary_knots_3) + days_since_last_active_chemo_30 + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   +  hospital_stays_10  + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource   + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + ns(active_chemo_days_30, knots = 0.49, Boundary.knots = boundary_knots_20)   +prev_bug_R_other_drug_non_bld + prev_bug_other_drug_R_bld  + prev_bug_R_drug_non_bld + prev_bug_S_drug_non_bld  + prev_bug_S_drug_bld+ IMDDecile,   
+                  family = binomial(link = "logit"), data = analysis_2
+)
+BIC(fit_imp_23)
+
+
+fit_imp_24 <- glm(resistant_result ~ time_gap_30  + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   +  hospital_stays_10  + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource  + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly +  active_chemo_days_30   +prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_2
+)
+BIC(fit_imp_24)
+
+fit_imp_24<-fit_imp_21
+cluster <- analysis_2$ClusterID
+# create explicit spline columns in your analysis_2 dataframe
+spline_basis <- as.data.frame(ns(analysis_2$time_gap_30,
+                                 knots = 6.083,
+                                 Boundary.knots = boundary_knots_3))
+# name them predictably
+names(spline_basis) <- paste0("ns_time_gap_30_", seq_len(ncol(spline_basis)))
+analysis_2_mod <- cbind(analysis_2, spline_basis)
+fit_imp_24_mod <- glm(resistant_result ~ ns_time_gap_30_1 + ns_time_gap_30_2  + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   +  hospital_stays_10  + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource  + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly   +prior_resistance + IMDPercentile,   
+                      family = binomial(link = "logit"), data = analysis_2_mod
+) # p of ns(time_gap)>0.01, so use linear one
+fit_imp_24 <- glm(resistant_result ~ time_gap_30  + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx   +  hospital_stays_10  + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource  + icu_stays + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly +  active_chemo_days_30   +prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_2
+)
+res <- iter_remove(fit_imp_24, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final2 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final2 <- sandwich::vcovCL(fit_final2, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td2 <- broom::tidy(fit_final2, conf.int = FALSE, vcov = vc_final2)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final2))[match(term, names(coef(fit_final2)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+# build the display table and format p-values
+tab_cs2 <- td2 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs2 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+
+##### Forward selection for interaction terms
+scope <- ~(  cancer_group+ ethnicity+ days_on_tested_abx+ num_prev_bld+ InfecSource+ cld_days_yearly+ prior_resistance ) *
+  ( cancer_group+ ethnicity+days_on_tested_abx+ num_prev_bld+ InfecSource+ cld_days_yearly+ prior_resistance)
+
+n <- nrow(analysis_2)
+
+fit_forward <-  with(
+  analysis_2,
+  step(glm(resistant_result ~  cancer_group+ ethnicity+ days_on_tested_abx+ num_prev_bld+ InfecSource+ cld_days_yearly+ prior_resistance,
+           family = binomial(), data = analysis_2),
+       scope = scope,
+       direction = "forward",
+       k = log(n))  # BIC instead of AIC
+)# dont add any
+```
+Enterobacterales and Fluoroquinolone
+```{r}
+analysis_3 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      abx == "Fluoroquinolone") %>%
+  filter(Result2 != "Unknown")
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_3 %>% select(  IMDPercentile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.57% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_3$time_gap_30 <- analysis_3$time_gap_last_abx / 30
+analysis_3$hospital_stays_10 <- analysis_3$hospital_stays / 10
+analysis_3$total_neut_10 <- analysis_3$total_neut / 10
+analysis_3$TestAge_10 <- analysis_3$TestAge / 10
+analysis_3$frailty_score_10 <- analysis_3$frailty_score/ 10
+analysis_3$IMDDecile <- analysis_3$IMDDecile
+analysis_3$time_to_test_yearly <- analysis_3$time_to_test/ 365
+analysis_3$days_on_any_abx_10 <- analysis_3$days_on_any_abx/ 10
+analysis_3$num_uc_10 <- analysis_3$num_uc/10
+analysis_3$cld_days_yearly <- analysis_3$cld_days/365
+analysis_3$active_chemo_days_30 <- analysis_3$active_chemo_days/30
+analysis_3$days_since_last_active_chemo_30 <- analysis_3$days_since_last_active_chemo/30
+analysis_3$time_gap_last_tested_abx_30 <- analysis_3$time_gap_last_tested_abx/30
+analysis_3$IMDPercentile <- analysis_3$IMDPercentile
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "icu_stays",
+  "time_gap_last_tested_abx_30",
+  "time_gap_last_tested_abx",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days_30",
+  "active_chemo_days",
+  "days_since_last_active_chemo",
+  "days_since_last_active_chemo_30"
+)
+
+# Apply outlier capping to all specified variables
+analysis_3[vars_to_cap] <- lapply(analysis_3[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_3$charlson<-as.numeric(analysis_3$charlson)
+analysis_3$days_on_tested_abx<-as.numeric(analysis_3$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource",  "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile", "IMDPercentile", "total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+amr_rsk_fct <- analysis_3 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+analysis_3 <- analysis_3 %>% filter(!is.na(IMDPercentile))
+
+```
+Univariable analysis
+```{r}
+univ_3_robust <- analysis_3 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",    "icu_stays",  "IMDPercentile", "IMDDecile",
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "days_since_last_active_chemo_30", "prior_resistance"
+    ),
+    exponentiate = FALSE, 
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+
+combined_df_3 <- bind_rows(
+  univ_3_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_3 <- combined_df_3 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_3 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+```
+
+Enterobacterales and Fluoroquinolone non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_3,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # linear relationship
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_3,
+  "days_on_tested_abx"
+)
+
+model_result_2 # linear relationship 
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_3,
+  "time_gap_30"
+)
+
+model_result_3 # linear
+
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_3,
+  "hospital_stays_10"
+)
+
+model_result_4 # linear relationship 
+
+
+
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_3,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_3,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_3,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 18
+
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_3,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_3,
+  "frailty_score_10"
+)
+
+model_result_9 # linear relationship
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_3,
+  "IMDDecile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_3,
+  "total_neut_10"
+)
+
+model_result_11  # linear relationship
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_3,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_3,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_3,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # linear relationship
+
+# calender days
+model_result_19 <- choose_spline_model(
+  analysis_3,
+  "cld_days_yearly"
+)
+
+model_result_19  # linear relationship
+
+# active_chemo_days_30
+model_result_20 <- choose_spline_model(
+  analysis_3,
+  "active_chemo_days_30"
+)
+
+model_result_20  # linear relationship
+```
+
+
+fit a logistic for "Enterobacterales" &  "Fluoroquinolone"
+```{r}
+#  Fit model using imputed data then compute BIC for each imputed dataset
+fit_imp_31 <- glm(resistant_result ~  LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30 + hospital_stays_10 + charlson + frailty_score_10  + total_neut_10+active_chemo_days_30 + active_chemo+ num_prev_bld + InfecSource  + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_3
+)
+vif(fit_imp_31)
+
+cluster = analysis_3$ClusterID
+
+res <- iter_remove(fit_imp_31, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final3 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final3 <- sandwich::vcovCL(fit_final3, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td3 <- broom::tidy(fit_final3, conf.int = FALSE, vcov = vc_final3)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final3))[match(term, names(coef(fit_final3)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+
+# build the display table and format p-values
+tab_cs3 <- td3 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs3 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+```
+Enterobacterales and Trimethoprim / Sulfamethoxazole TMP-SMX
+```{r}
+analysis_4 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      abx == "TMP-SMX") %>%
+  filter(Result2!="Unknown")
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_4 %>% select( IMDDecile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.58% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_4$time_gap_30 <- analysis_4$time_gap_last_abx / 30
+analysis_4$hospital_stays_10 <- analysis_4$hospital_stays / 10
+analysis_4$total_neut_10 <- analysis_4$total_neut / 10
+analysis_4$TestAge_10 <- analysis_4$TestAge / 10
+analysis_4$frailty_score_10 <- analysis_4$frailty_score / 10
+analysis_4$IMDDecile <- analysis_4$IMDDecile
+analysis_4$time_to_test_yearly <- analysis_4$time_to_test / 365
+analysis_4$days_on_any_abx_10 <- analysis_4$days_on_any_abx / 10
+analysis_4$num_uc_10 <- analysis_4$num_uc / 10
+analysis_4$cld_days_yearly <- analysis_4$cld_days / 365
+analysis_4$days_since_last_active_chemo_30 <- analysis_4$days_since_last_active_chemo/30
+analysis_4$active_chemo_days_30 <- analysis_4$active_chemo_days/30
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "icu_stays",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo",
+  "active_chemo_days_30",
+  "active_chemo_days"
+)
+
+# Apply outlier capping to all specified variables
+analysis_4[vars_to_cap] <- lapply(analysis_4[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_4$charlson<-as.numeric(analysis_4$charlson)
+analysis_4$days_on_tested_abx<-as.numeric(analysis_4$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource", "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDPercentile", "total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+
+
+amr_rsk_fct <- analysis_4 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+analysis_4 <- analysis_4 %>% filter(!is.na(IMDPercentile))
+```
+Univariable analysis
+```{r}
+univ_4_robust <- analysis_4 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",    "icu_stays",  "IMDPercentile",
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "days_since_last_active_chemo_30", "prior_resistance"
+    ),
+    exponentiate = FALSE, 
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+
+combined_df_4 <- bind_rows(
+  univ_4_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_4 <- combined_df_4 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_4 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+
+```
+
+Enterobacterales and TMP-SMX  non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_4,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # linear relationship
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_4,
+  "days_on_tested_abx"
+)
+
+model_result_2 # linear relationship 
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_4,
+  "time_gap_30"
+)
+
+model_result_3 # linear
+
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_4,
+  "hospital_stays_10"
+)
+
+model_result_4 # linear relationship 
+
+
+
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_4,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_4,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_4,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 18, but looks linear, so just use linear
+
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_4,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_4,
+  "frailty_score_10"
+)
+
+model_result_9 # linear relationship
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_4,
+  "IMDPercentile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_4,
+  "total_neut_10"
+)
+
+model_result_11  # linear relationship
+
+
+
+# icu_stays, time_last_bug_bld_30, time_gap_bug_any_micro_30, num_uc_10, num_uc_pt_bug
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_4,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_4,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_4,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # linear relationship
+
+# calender days
+# num_uc_pt_bug
+model_result_19 <- choose_spline_model(
+  analysis_4,
+  "cld_days_yearly"
+)
+
+model_result_19  # non-linear relationship, knots at 4.226795 and 5.786904
+
+data_19= data.frame(cld_days_yearly=seq(0, quantile(analysis_4$cld_days_yearly,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                    ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                    days_on_any_abx_10=1, time_to_test_yearly = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                    InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, hospital_stays_10 = 0, prior_resistance = "No_prior_iso", time_gap_30 = 0)
+
+resistant_link= predict(model_19,
+                        newdata = data_19, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_19$pred=resistant_odds
+data_19$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_19$lower <- lower_link
+data_19$upper <- upper_link
+
+p = ggplot(data_19, aes(cld_days_yearly , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.1, 1),
+    breaks = c(0.1, 0.05, 0.2, 0.5, 1),
+    labels = c("0.01", "0.05", "0.2", "0.5", "1"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Years since 01/04/2015") +
+  labs(title = "")
+ggsave("/home/anniehu/AMR Cancer/analysis_4_cld_days.png", p, width = 6, height = 4)
+
+model_result_20 <- choose_spline_model(
+  analysis_4,
+  "active_chemo_days"
+)
+
+model_result_20  #  linear relationship 
+
+
+
+
+
+
+```
+
+fit a logistic for "Enterobacterales" &  "TMP-SMX"
+```{r}
+fit_imp_41 <- glm(resistant_result ~ ns(cld_days_yearly, knots = c(4.043767, 5.534151), Boundary.knots = boundary_knots_19)  + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30 +  hospital_stays_10 + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource  + icu_stays  + csu + num_uc_10 + num_uc_pt_bug   + active_chemo_days_30 + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_4
+)
+BIC(fit_imp_41)
+
+fit_imp_42 <-  glm(resistant_result ~  hospital_stays_10  +  time_to_test_yearly+  num_prev_bld  + LinkedSex + cancer_group  + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30  + charlson + frailty_score_10 + total_neut_10 + active_chemo  + InfecSource  + icu_stays  + csu + num_uc_10 + num_uc_pt_bug +  cld_days_yearly +active_chemo_days_30 + prior_resistance+ IMDPercentile,   
+                   family = binomial(link = "logit"), data = analysis_4
+)
+BIC(fit_imp_42)
+vif(fit_imp_42)
+
+res <- iter_remove(fit_imp_42, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final4 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final4 <- sandwich::vcovCL(fit_final4, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td4 <- broom::tidy(fit_final4, conf.int = FALSE, vcov = vc_final4)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final4))[match(term, names(coef(fit_final4)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+
+# build the display table and format p-values
+tab_cs4 <- td4 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs4 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+```
+Enterobacterales and Gentamicin
+```{r}
+analysis_5 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      abx == "Gentamicin") %>%
+  filter(!is.na(resistant_result))
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_5 %>% select( IMDDecile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.53% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_5$time_gap_30 <- analysis_5$time_gap_last_abx / 30
+analysis_5$hospital_stays_10 <- analysis_5$hospital_stays / 10
+analysis_5$TestAge_10 <- analysis_5$TestAge / 10
+analysis_5$frailty_score_10 <- analysis_5$frailty_score/ 10
+analysis_5$IMDDecile <- analysis_5$IMDDecile
+analysis_5$IMDPercentile <- analysis_5$IMDPercentile
+analysis_5$time_to_test_yearly <- analysis_5$time_to_test/ 365
+analysis_5$days_on_any_abx_10 <- analysis_5$days_on_any_abx/ 10
+analysis_5$num_uc_10 <- analysis_5$num_uc/10
+analysis_5$cld_days_yearly <- analysis_5$cld_days/365
+analysis_5$active_chemo_days_30 <- analysis_5$active_chemo_days/30
+analysis_5$total_neut_10 <- analysis_5$total_neut/10
+analysis_5$days_since_last_active_chemo_30 <- analysis_5$days_since_last_active_chemo / 30
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "icu_stays",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days_30",
+  "active_chemo_days",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo"
+)
+
+# Apply outlier capping to all specified variables
+analysis_5[vars_to_cap] <- lapply(analysis_5[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_5$charlson<-as.numeric(analysis_5$charlson)
+analysis_5$days_on_tested_abx<-as.numeric(analysis_5$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource", "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile", "IMDPercentile", "total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+
+amr_rsk_fct <- analysis_5 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+analysis_5 <- analysis_5 %>% filter(!is.na(IMDPercentile)) 
+```
+Univariable analysis
+```{r}
+univ_5_robust <- analysis_5 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",    "icu_stays",  "IMDPercentile",
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "days_since_last_active_chemo_30", "prior_resistance"
+      
+    ),
+    exponentiate = FALSE,
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+combined_df_5 <- bind_rows(
+  univ_5_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_5 <- combined_df_5 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_5 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+
+```
+
+Enterobacterales and TMP-SMX  non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_5,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # linear relationship
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_5,
+  "days_on_tested_abx"
+)
+
+model_result_2 # linear relationship 
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_5,
+  "time_gap_30"
+)
+
+model_result_3 # linear
+
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_5,
+  "hospital_stays_10"
+)
+
+model_result_4 # linear relationship 
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_5,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_5,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_5,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 18, but looks linear, so just use linear
+
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_5,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_5,
+  "frailty_score_10"
+)
+
+model_result_9 # linear relationship
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_5,
+  "IMDPercentile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_5,
+  "total_neut_10"
+)
+
+model_result_11  # linear relationship
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_5,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_5,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_5,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # non-linear relationship, knot at 5
+
+# calender days
+model_result_19 <- choose_spline_model(
+  analysis_5,
+  "cld_days_yearly"
+)
+
+model_result_19  # linear relationship
+
+# active_chemo_days_30
+model_result_20 <- choose_spline_model(
+  analysis_5,
+  "active_chemo_days_30"
+)
+
+model_result_20  # linear relationship
+```
+fit a logistic for "Enterobacterales" &  "Gentamincin"
+```{r}
+fit_imp_51 <- glm(resistant_result ~ num_uc_pt_bug + LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30 +hospital_stays_10 + charlson + frailty_score_10 + total_neut_10 + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu +num_uc_10  + cld_days_yearly + active_chemo_days_30   + IMDPercentile + prior_resistance,
+                  family = binomial(link = "logit"), data = analysis_5
+)
+BIC(fit_imp_51)
+fit_imp_52 <- fit_imp_51# remove non-linear num_uc_pt_bug, use fit_imp_52
+vif(fit_imp_52)
+cluster = analysis_5$ClusterID
+res <- iter_remove(fit_imp_51, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final5 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final5 <- sandwich::vcovCL(fit_final5, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td5 <- broom::tidy(fit_final5, conf.int = FALSE, vcov = vc_final5)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final5))[match(term, names(coef(fit_final5)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+# build the display table and format p-values
+tab_cs5 <- td5 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs5 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+
+
+#  sensitivity analysis
+fit_final5_2 <- glm(resistant_result ~ cancer_group +  frailty_score_10 +prior_resistance+days_on_tested_abx,   
+                    family = binomial(link = "logit"), data = analysis_5
+)
+
+#  compute cluster-robust vcov
+vc_final5_2 <- sandwich::vcovCL(fit_final5_2, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td5_2 <- broom::tidy(fit_final5_2, conf.int = FALSE, vcov = vc_final5_2)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final5_2))[match(term, names(coef(fit_final5_2)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+# build the display table and format p-values
+tab_cs5_2 <- td5_2 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs5_2 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+```
+
+Piperacillin / Tazobactam
+```{r}
+analysis_6 <- analysis_data %>%
+  filter(
+    buggroup == "Enterobacterales" & 
+      abx == "Piperacillin-tazobactam") %>%
+  filter(!is.na(resistant_result))
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_6 %>% select( IMDDecile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.53% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_6$time_gap_30 <- analysis_6$time_gap_last_abx / 30
+analysis_6$hospital_stays_10 <- analysis_6$hospital_stays / 10
+analysis_6$total_neut_10 <- analysis_6$total_neut / 10
+analysis_6$TestAge_10 <- analysis_6$TestAge / 10
+analysis_6$frailty_score_10 <- analysis_6$frailty_score / 10
+analysis_6$IMDDecile <- analysis_6$IMDDecile
+analysis_6$time_to_test_yearly <- analysis_6$time_to_test / 365
+analysis_6$days_on_any_abx_10 <- analysis_6$days_on_any_abx / 10
+analysis_6$num_uc_10 <- analysis_6$num_uc / 10
+analysis_6$cld_days_yearly <- analysis_6$cld_days / 365
+analysis_6$active_chemo_days_30 <- analysis_6$active_chemo_days/30
+analysis_6$days_since_last_active_chemo_30<- analysis_6$days_since_last_active_chemo/30
+
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10",
+  "icu_stays",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days_30",
+  "active_chemo_days",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo"
+  
+)
+
+# Apply outlier capping to all specified variables
+analysis_6[vars_to_cap] <- lapply(analysis_6[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_6$charlson<-as.numeric(analysis_6$charlson)
+analysis_6$days_on_tested_abx<-as.numeric(analysis_6$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource",   "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile",  "IMDPercentile", "total_neut", "icu_stays",  "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+
+amr_rsk_fct <- analysis_6 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+analysis_6 <- analysis_6 %>% filter(!is.na(IMDPercentile))
+```
+Univariable analysis
+```{r}
+univ_6_robust <- analysis_6 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource", "IMDPercentile",   "icu_stays",  
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "prior_resistance"
+    ),
+    exponentiate = FALSE, 
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+combined_df_6 <- bind_rows(
+  univ_6_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_6 <- combined_df_6 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_6 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+
+```
+
+Enterobacterales and Piperacillin / Tazobactam non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_6,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # non-linear relationship, knot at 3.476 but looks linear so just use linear
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_6,
+  "days_on_tested_abx"
+)
+
+model_result_2 # non-linear relationship, knots at 9.1 and 15.9 but looks linear so just use linear
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_6,
+  "time_gap_30"
+)
+
+model_result_3 # non-linear, knot at 6.083333
+
+
+data_3= data.frame(time_gap_30=seq(0, quantile(analysis_1$time_gap_30,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                   ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                   days_on_any_abx_10=1, time_to_test_yearly = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                   InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, hospital_stays_10 = 0, prior_resistance = "No_prior_iso")
+
+resistant_link= predict(model_3,
+                        newdata = data_3, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_3$pred=resistant_odds
+data_3$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_3$lower <- lower_link
+data_3$upper <- upper_link
+
+p = ggplot(data_3, aes(time_gap_30 , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.01, 1),
+    breaks = c(0.01, 0.05, 0.2, 0.5, 1),
+    labels = c("0.01", "0.05", "0.2", "0.5", "1"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Months since the last use of antibiotics") +
+  labs(title = "")
+ggsave("/home/anniehu/AMR Cancer/analysis_2_time_gap.png", p, width = 6, height = 4)
+
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_6,
+  "hospital_stays_10"
+)
+
+model_result_4 # non-linear relationship, 6.3
+data_4= data.frame(hospital_stays_10=seq(0, quantile(analysis_6$hospital_stays_10,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                   ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                   days_on_any_abx_10=1, time_to_test_yearly = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                   InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, time_gap_30 = 0, prior_resistance = "No_prior_iso")
+
+resistant_link= predict(model_4,
+                        newdata = data_4, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_4$pred=resistant_odds
+data_4$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_4$lower <- lower_link
+data_4$upper <- upper_link
+
+p = ggplot(data_4, aes(hospital_stays_10 , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.05, 1),
+    breaks = c( 0.05, 0.1, 0.2, 0.5, 1),
+    labels = c( "0.05", "0.1","0.2", "0.5", "1"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Total days in hospiatl") +
+  labs(title = "")
+ggsave("/home/anniehu/AMR Cancer/analysis_2_time_gap.png", p, width = 6, height = 4)
+
+
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_6,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_6,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken, spline has smaller BIC, but plot looks very linear, so use linear
+model_result_7 <- choose_spline_model(
+  analysis_6,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 18, but looks linear, so just use linear 
+
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_6,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_6,
+  "frailty_score_10"
+)
+
+model_result_9 # non-linear relationship, 2.27
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_6,
+  "IMDPercentile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_6,
+  "total_neut_10"
+)
+
+model_result_11  # linear relationship
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_6,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_6,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_6,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # linear
+
+# calender days
+# num_uc_pt_bug
+model_result_19 <- choose_spline_model(
+  analysis_6,
+  "cld_days_yearly"
+)
+
+model_result_19  # linear relationship
+
+model_result_20 <- choose_spline_model(
+  analysis_6,
+  "active_chemo_days_30"
+)
+
+model_result_20  # linear relationship
+
+
+# All linear relationships in analysis_6
+range_min_3  <- min(analysis_6$time_gap_30, na.rm = TRUE)
+range_max_3 <- max(analysis_6$time_gap_30, na.rm = TRUE)
+boundary_knots_3  <- c(range_min_3  + 0.1 * (range_max_3  - range_min_3 ),
+                       range_min_3  + 0.9 * (range_max_3  - range_min_3 ))
+model_3 <- glm(
+  resistant_result ~ ns(time_gap_30, 
+                        #                       df = 2,
+                        #                     knots = quantile(hospital_stays_10, probs = c(0.4, 0.6), na.rm = TRUE),
+                        knots = c(6.083333),
+                        Boundary.knots = boundary_knots_3),
+  data = analysis_6,
+  family = binomial()
+)
+
+
+range_min_4  <- min(analysis_6$hospital_stays_10, na.rm = TRUE)
+range_max_4  <- max(analysis_6$hospital_stays_10, na.rm = TRUE)
+boundary_knots_4  <- c(range_min_4  + 0.1 * (range_max_4  - range_min_4 ),
+                       range_min_4  + 0.9 * (range_max_4  - range_min_4 ))
+model_4 <- glm(
+  resistant_result ~ ns(hospital_stays_10, 
+                        #                       df = 2,
+                        #                     knots = quantile(hospital_stays_10, probs = c(0.4, 0.6), na.rm = TRUE),
+                        knots = c(6.3),
+                        Boundary.knots = boundary_knots_4),
+  data = analysis_6,
+  family = binomial()
+)
+```
+
+fit a logistic for "Enterobacterales" &  "Piperacillin / Tazobactam"
+```{r}
+fit_imp_61 <- glm(resistant_result ~ ns(time_gap_30, knots = c(6.083333), Boundary.knots = boundary_knots_3)  + ns(hospital_stays_10,  knots = c(6.402), Boundary.knots = boundary_knots_4) + time_to_test_yearly + frailty_score_10 +  days_since_last_active_chemo_30 + LinkedSex + cancer_group + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx  +  charlson +  total_neut_10 + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_6
+)
+BIC(fit_imp_61)
+
+fit_imp_62 <- glm(resistant_result ~ time_gap_30  + ns(hospital_stays_10,  knots = c(6.402), Boundary.knots = boundary_knots_4) + time_to_test_yearly + frailty_score_10 +  days_since_last_active_chemo_30 + LinkedSex + cancer_group + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx  +  charlson +  total_neut_10 + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_6
+)
+BIC(fit_imp_62)# remove non-linear time_gap_30
+
+
+fit_imp_63 <- glm(resistant_result ~ time_gap_30  + hospital_stays_10+ time_to_test_yearly + frailty_score_10 +  days_since_last_active_chemo_30 + LinkedSex + cancer_group + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx  +  charlson +  total_neut_10 + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_6
+)
+BIC(fit_imp_63)# remove non-linear hospital_stays_10
+
+
+fit_imp_64 <-glm(resistant_result ~ time_gap_30  + hospital_stays_10+ time_to_test_yearly + frailty_score_10  + LinkedSex + cancer_group + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx  +  charlson +  total_neut_10 + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30 + prior_resistance + IMDPercentile,   
+                 family = binomial(link = "logit"), data = analysis_6
+)
+BIC(fit_imp_64)# remove non-linear total_neut
+
+fit_imp_65 = fit_imp_64
+cluster = analysis_6$ClusterID
+
+
+res <- iter_remove(fit_imp_65, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final6 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final6 <- sandwich::vcovCL(fit_final6, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td6 <- broom::tidy(fit_final6, conf.int = FALSE, vcov = vc_final6)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final6))[match(term, names(coef(fit_final6)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+
+# build the display table and format p-values
+tab_cs6 <- td6 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs6 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+```
+Enterococcus faecalis/faecium and Vancomycin
+```{r}
+analysis_7 <- analysis_data %>%
+  filter(
+    buggroup == "Enterococcus faecalis/faecium" & 
+      abx == "Vancomycin") %>%
+  filter(!is.na(resistant_result))
+# Check the proportion of data which contains any missing values
+rows_with_missing <- apply(analysis_7 %>% select(IMDDecile), 1, function(row) any(is.na(row)))
+proportion_with_missing <- mean(rows_with_missing)
+proportion_with_missing # 0.5% of rows containing missing values
+
+#Deal with outliers
+# Create scaled versions before capping
+analysis_7$time_gap_30 <- analysis_7$time_gap_last_abx / 30
+analysis_7$hospital_stays_10 <- analysis_7$hospital_stays / 10
+analysis_7$total_neut_10 <- analysis_7$total_neut / 10
+analysis_7$TestAge_10 <- analysis_7$TestAge / 10
+analysis_7$frailty_score_10 <- analysis_7$frailty_score / 10
+analysis_7$IMDDecile <- analysis_7$IMDDecile
+analysis_7$time_to_test_yearly <- analysis_7$time_to_test / 365
+analysis_7$days_on_any_abx_10 <- analysis_7$days_on_any_abx / 10
+analysis_7$num_uc_10 <- analysis_7$num_uc / 10
+analysis_7$cld_days_yearly <- analysis_7$cld_days / 365
+analysis_7$active_chemo_days_30 <- analysis_7$active_chemo_days / 30
+analysis_7$days_since_last_active_chemo_30 <- analysis_7$days_since_last_active_chemo / 30
+
+# Variables to cap
+vars_to_cap <- c(
+  "days_on_tested_abx",
+  "charlson",
+  "num_prev_bld",
+  "TestAge_10",
+  "TestAge",
+  "total_neut_10",
+  "total_neut",
+  "hospital_stays_10",
+  "hospital_stays",
+  "time_gap_30",
+  "time_gap_last_abx",
+  "frailty_score_10",
+  "frailty_score",
+  "IMDDecile",
+  "IMDPercentile",
+  "time_to_test_yearly",
+  "time_to_test",
+  "days_on_any_abx",
+  "days_on_any_abx_10", 
+  "icu_stays",
+  "num_uc_10",
+  "num_uc_pt_bug",
+  "cld_days",
+  "cld_days_yearly",
+  "active_chemo_days_30",
+  "active_chemo_days",
+  "days_since_last_active_chemo_30",
+  "days_since_last_active_chemo"
+)
+
+# Apply outlier capping to all specified variables
+analysis_7[vars_to_cap] <- lapply(analysis_7[vars_to_cap], cap_outliers)
+```
+Descriptive stats of LinkedSex, cancer_group, time_to_cancer, time_to_test, ethnicity, test_age_group, TestAge, days_on_any_abx, days_on_tested_abx, time_gap_last_abx, hospital_stays, prev_infection, prev_infection_bld, charlson, frailty_score, IMDScore, total_neut, active_chemo, num_prev_bld, InfecSource
+```{r}
+analysis_7$charlson<-as.numeric(analysis_7$charlson)
+analysis_7$days_on_tested_abx<-as.numeric(analysis_7$days_on_tested_abx)
+categorical_vars <- c("LinkedSex", "ethnicity", "cancer_group", "time_to_cancer", "test_age_group", "active_chemo", "InfecSource", "csu", "prior_resistance")
+continuous_vars <- c("TestAge", "days_on_tested_abx", "charlson", "hospital_stays", "num_prev_bld", "time_to_test_yearly", "days_on_any_abx", "time_gap_last_abx", "frailty_score", "IMDDecile", "IMDPercentile","total_neut", "icu_stays", "num_uc", "num_uc_pt_bug", "cld_days", "active_chemo_days", "days_since_last_active_chemo")
+
+
+amr_rsk_fct <- analysis_7 |>
+  tbl_summary(
+    type = list(
+      continuous_vars ~ "continuous",
+      categorical_vars ~ "categorical"),
+    by = resistant_result,
+    include = c(categorical_vars, continuous_vars, "resistant_result"),
+    label = list(LinkedSex = "Sex"),
+    statistic = list(all_continuous() ~ "{median} ({p25},{p75})",
+                     all_categorical() ~ "{n} ({p})"),
+    digits = list(all_continuous() ~ 1,
+                  all_categorical() ~ c(0,1)),
+    percent = "cell"  # Show n and % based on entire population
+  ) |>
+  add_overall(last = TRUE)
+amr_rsk_fct
+analysis_7 <- analysis_7 %>%
+  filter(cancer_group != "Melanoma") %>%
+  mutate(cancer_group = droplevels(cancer_group)) # remove melanoma
+analysis_7 <- analysis_7 %>% filter(!is.na(IMDPercentile))
+```
+Univariable analysis
+```{r}
+univ_7_robust <- analysis_7 %>%
+  tbl_uvregression(
+    method = glm,
+    y = resistant_result,
+    method.args = list(family = binomial),
+    include = c(
+      "LinkedSex", "cancer_group", "time_to_cancer", "time_to_test_yearly", "ethnicity",
+      "test_age_group", "TestAge_10", "days_on_any_abx_10", "days_on_tested_abx",
+      "time_gap_30", "hospital_stays_10" ,
+      "charlson", "frailty_score_10", "total_neut_10", "active_chemo", "num_prev_bld",
+      "InfecSource",  "icu_stays",  
+      "csu", "num_uc_10", "num_uc_pt_bug",  "cld_days_yearly", "active_chemo_days_30", "prior_resistance"
+    ),
+    exponentiate = FALSE, # We have set exponentiate = true inside tidy_robust(), the tidier will return exponential of coefficients (β) and their CIs on the log-odds scale.Then tbl_uvregression(exponentiate = FALSE) will handle exponentiating those values to odds ratios for display.
+    tidy_fun = function(x, ...) tidy_robust(x, cluster_var = ~ClusterID),
+    pvalue_fun = label_style_pvalue(digits = 2)
+  ) %>%
+  add_nevent() %>%
+  add_q() %>%
+  bold_p() %>%
+  bold_p(t = 0.05, q = TRUE) %>%
+  bold_labels()
+
+combined_df_7 <- bind_rows(
+  univ_7_robust$table_body %>% mutate(OR_CI = paste0(round(estimate, 2), " (", round(conf.low, 2), ", ", round(conf.high, 2), ")"),
+                                      OR = round(estimate, 2)) %>% select(term, OR_CI, OR, conf.low, conf.high, p.value)
+)
+
+combined_df_7 <- combined_df_7 %>%
+  mutate(
+    q.value = p.adjust(p.value, method = "fdr")
+  )
+# display table
+combined_df_7 %>%
+  select(term, OR_CI, p.value, q.value) %>%
+  gt() %>%
+  tab_header(
+    title = "Model Estimates with Confidence Intervals",
+    subtitle = "Includes FDR-adjusted q-values"
+  ) %>%
+  fmt_number(
+    columns = c(p.value, q.value),
+    decimals = 3
+  ) %>%
+  cols_label(
+    term = "Variable",
+    OR_CI = "Estimate (95% CI)",
+    p.value = "p-value",
+    q.value = "q-value (FDR)"
+  )
+```
+
+Vancomycin in Enterococcus faecalis/faecium  non-linear relationships
+```{r, fig.width=10, fig.height=4}
+# days_on_any_abx_10
+model_result_1 <- choose_spline_model(
+  analysis_7,
+  "days_on_any_abx_10"
+)
+
+model_result_1 # linear relationship
+
+# days on tested abx
+model_result_2 <- choose_spline_model(
+  analysis_7,
+  "days_on_tested_abx"
+)
+
+model_result_2 # linear relationship 
+
+# time gap last abx used
+model_result_3 <- choose_spline_model(
+  analysis_7,
+  "time_gap_30"
+)
+
+model_result_3 # non-linear, knot at 6.08
+
+data_3= data.frame(time_gap_30=seq(0, quantile(analysis_7$time_gap_30,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                   ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                   days_on_any_abx_10=1, time_to_test_yearly = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                   InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, hospital_stays_10 = 0, prior_resistance = "No_prior_iso")
+
+model_3 <- glm(
+  resistant_result ~ ns(time_gap_30, 
+                        knots = 6.08,
+                        Boundary.knots = boundary_knots_3),
+  data = analysis_7,
+  family = binomial()
+)
+data_3= data.frame(time_gap_30=seq(0, quantile(analysis_2$time_gap_30,.95), 0.2), LinkedSex="M", cancer_group = "Colorectal", 
+                   ethnicity = "White", TestAge_10 = 10, num_prev_bld=0, prev_infection=0, days_on_tested_abx = 0, 
+                   days_on_any_abx_10=1, time_to_test_yearly = 0, charlson = 0, frailty_score_10 = 0, IMDPercentile=0, total_neut_10=0, 
+                   InfecSource="Hospital", active_chemo = 1,prev_infection_bld = 1, hospital_stays_10 = 0, prior_resistance = "No_prior_iso")
+
+resistant_link= predict(model_3,
+                        newdata = data_3, type = "link", se.fit = TRUE)
+
+eta <- resistant_link$fit                 # log-odds
+se  <- resistant_link$se.fit
+resistant_odds <- exp(eta)           # odds
+
+data_3$pred=resistant_odds
+data_3$model="Univariable"
+
+z <- qnorm(0.975)  # 1.96 for 95% CI
+lower_link <- exp(eta - z*se)
+upper_link <- exp(eta + z*se)
+data_3$lower <- lower_link
+data_3$upper <- upper_link
+
+
+
+p = ggplot(data_3, aes(time_gap_30 , pred))+
+  geom_line(aes(color=model))+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill=model), alpha = 0.2) +
+  theme_light()+
+  # Log-scaled x-axis
+  scale_y_log10(
+    limits = c(0.000000001, 1),
+    breaks = c(0.000000001, 0.1, 0.5, 1),
+    labels = c("0", "0.1", "0.5", "1"),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  ylab("Predicted OR (95% CI)") +
+  xlab("Months since the last use of antibiotics") +
+  labs(title = "")
+ggsave("/home/anniehu/AMR Cancer/analysis_7_time_gap.png", p, width = 6, height = 4)
+
+# hospital stays
+model_result_4 <- choose_spline_model(
+  analysis_7,
+  "hospital_stays_10"
+)
+
+model_result_4 # linear relationship
+
+
+
+
+# TestAge
+model_result_5 <- choose_spline_model(
+  analysis_7,
+  "TestAge_10"
+)
+
+model_result_5 # linear relationship
+
+# Time to test:
+model_result_6 <- choose_spline_model(
+  analysis_7,
+  "time_to_test_yearly"
+)
+
+model_result_6 # linear relationship
+
+
+# Number of previous blood cultures taken
+model_result_7 <- choose_spline_model(
+  analysis_7,
+  "num_prev_bld"
+)
+
+model_result_7 # non-linear relationship, knot at 28.97, but looks linear, so just use linear
+
+
+
+# charlson
+model_result_8 <- choose_spline_model(
+  analysis_7,
+  "charlson"
+)
+
+model_result_8 # linear relationship
+
+# frailty
+model_result_9 <- choose_spline_model(
+  analysis_7,
+  "frailty_score_10"
+)
+
+model_result_9 # linear relationship
+
+# IMD
+model_result_10 <- choose_spline_model(
+  analysis_7,
+  "IMDPercentile"
+)
+
+model_result_10 # linear relationship
+
+
+
+# NEUTROPHIL
+model_result_11 <- choose_spline_model(
+  analysis_7,
+  "total_neut_10"
+)
+
+model_result_11  # non-linear relationship, knot at 6.58, But looks linear so use linear
+
+# icu_stays
+model_result_14 <- choose_spline_model(
+  analysis_7,
+  "icu_stays"
+)
+
+model_result_14  # linear relationship
+
+
+
+# num_uc_10
+model_result_17 <- choose_spline_model(
+  analysis_7,
+  "num_uc_10"
+)
+
+model_result_17  # linear relationship
+
+
+# num_uc_pt_bug
+model_result_18 <- choose_spline_model(
+  analysis_7,
+  "num_uc_pt_bug"
+)
+
+model_result_18  # linear relationship
+
+# calender days
+model_result_19 <- choose_spline_model(
+  analysis_7,
+  "cld_days_yearly"
+)
+
+model_result_19  # linear relationship
+
+# active chemo days
+model_result_20 <- choose_spline_model(
+  analysis_7,
+  "active_chemo_days_30"
+)
+
+model_result_20  # linear relationship
+
+# days_since_last_active_chemo
+model_result_21 <- choose_spline_model(
+  analysis_7,
+  "days_since_last_active_chemo_30"
+)
+
+model_result_21  # non-linear relationship, knot at 6.1
+
+range_min_3  <- min(analysis_7$time_gap_30, na.rm = TRUE)
+range_max_3  <- max(analysis_7$time_gap_30, na.rm = TRUE)
+boundary_knots_3  <- c(range_min_3  + 0.1 * (range_max_3  - range_min_3 ),
+                       range_min_3  + 0.9 * (range_max_3  - range_min_3 ))
+model_3 <- glm(
+  resistant_result ~ ns(time_gap_30, 
+                        #                       df = 2,
+                        #                     knots = quantile(hospital_stays_10, probs = c(0.4, 0.6), na.rm = TRUE),
+                        knots = c(6.08),
+                        Boundary.knots = boundary_knots_3),
+  data = analysis_7,
+  family = binomial()
+)
+
+range_min_11  <- min(analysis_7$total_neut_10, na.rm = TRUE)
+range_max_11  <- max(analysis_7$total_neut_10, na.rm = TRUE)
+boundary_knots_11  <- c(range_min_3  + 0.1 * (range_max_11  - range_min_11 ),
+                        range_min_3  + 0.9 * (range_max_11  - range_min_11 ))
+model_11 <- glm(
+  resistant_result ~ ns(time_gap_30, 
+                        #                       df = 2,
+                        #                     knots = quantile(hospital_stays_10, probs = c(0.4, 0.6), na.rm = TRUE),
+                        knots = c(6.58),
+                        Boundary.knots = boundary_knots_3),
+  data = analysis_7,
+  family = binomial()
+)
+
+```
+
+fit a logistic for "Enterobacterales" &  "vancomicin"
+```{r}
+fit_imp_71 <- glm(resistant_result ~  LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + ns(time_gap_30,  knots = c(6.08),  Boundary.knots = boundary_knots_3) + hospital_stays_10 + charlson + frailty_score_10 + ns(total_neut_10, knots = 6.58, Boundary.knots = boundary_knots_11) + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30   + prior_resistance + IMDPercentile,   
+                  family = binomial(link = "logit"), data = analysis_7
+)
+BIC(fit_imp_71)
+
+fit_imp_72 <-  glm(resistant_result ~ LinkedSex + cancer_group + time_to_test_yearly + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30 + hospital_stays_10 + charlson + frailty_score_10 + ns(total_neut_10, knots = 6.58, Boundary.knots = boundary_knots_11)  + active_chemo + num_prev_bld + InfecSource + icu_stays  + csu + num_uc_10 + num_uc_pt_bug + cld_days_yearly + active_chemo_days_30   + prior_resistance + IMDPercentile,
+                   family = binomial(link = "logit"), data = analysis_7
+)
+BIC(fit_imp_72) # remove non-linear time_gap_30
+
+fit_imp_73 <-glm(resistant_result ~ hospital_stays_10  +  time_to_test_yearly+  num_prev_bld  + LinkedSex + cancer_group  + ethnicity  + TestAge_10 + days_on_any_abx_10 + days_on_tested_abx + time_gap_30   + frailty_score_10 + total_neut_10 + InfecSource  + icu_stays  + csu + num_uc_10  +  cld_days_yearly +active_chemo_days_30 + prior_resistance+ IMDPercentile,
+                 family = binomial(link = "logit"), data = analysis_7
+)# remove ns total_neut
+
+cluster = analysis_7$ClusterID
+
+
+res <- iter_remove(fit_imp_73, cluster = cluster, alpha = 0.05, protected = c("cancer_group"))
+
+#  final model
+fit_final7 <- res$final_model
+
+#  compute cluster-robust vcov
+vc_final7 <- sandwich::vcovCL(fit_final7, cluster = cluster)
+
+#  tidy with vcov, exponentiate = TRUE to return ORs directly
+td7 <- broom::tidy(fit_final7, conf.int = FALSE, vcov = vc_final7)%>%   # get coef table without broom doing CIs
+  # join explicit vc-based inference
+  mutate(
+    # extract robust vcov and compute robust SEs explicitly
+    se_robust = sqrt(diag(vc_final7))[match(term, names(coef(fit_final7)))],
+    z = estimate / se_robust,
+    p.value = 2 * (1 - pnorm(abs(z))),
+    conf.low = estimate - qnorm(0.975) * se_robust,
+    conf.high = estimate + qnorm(0.975) * se_robust,
+    # exponentiate to get OR scale
+    OR = exp(estimate),
+    conf.low = exp(conf.low),
+    conf.high = exp(conf.high)
+  ) 
+
+
+# build the display table and format p-values
+tab_cs7 <- td7 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    OR = round(OR, 2),
+    conf.low = conf.low,
+    conf.high = conf.high,
+    p.value = ifelse(is.na(p.value), NA_character_,
+                     ifelse(p.value < 0.001, "<0.001", format.pval(p.value, digits = 3)))
+  ) %>%
+  mutate(OR_CI = paste0(sprintf("%.2f", OR), " (", sprintf("%.2f", conf.low), ", ", sprintf("%.2f", conf.high), ")")) %>%
+  select(term, OR_CI, OR, conf.low, conf.high, p.value)
+
+# print
+tab_cs7 %>%
+  gt() %>%
+  tab_header(title = "Odds ratios (95% CI) — cluster-robust")
+
+
+fit_final7_2 <- glm(resistant_result ~cancer_group + TestAge_10+cld_days_yearly+prior_resistance+days_on_tested_abx ,
+                    family = binomial(link = "logit"), data = analysis_7
+)
+```
