@@ -964,7 +964,7 @@ analysis_data <- df_rsk_fct %>%
     time_gap_last_tested_abx = time_gap_last_tested_abx,
     cancer_group = factor(cancer_group, levels = c("Colorectal", "Others", "Lymphoid/Haematopoietic", "Other skin", "Breast", "Upper GI and hepatobiliary", "Prostate", "Lung", "Melanoma")),
     prior_resistance = factor(prior_resistance, levels = c("No_prior_iso", "R_target", "R_other_only", "Fully_S"))
-  ) %>% filter(CollectionDateTime>="2016-04-01")
+  )
 
 
 ############## comorbidity and frailty score at the first cancer diagnosis code for patients with records of our interested bug-drug combinations
